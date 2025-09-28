@@ -518,16 +518,14 @@ select_multiple_nodes() {
     return 0
 }
 
-# 5) Update nym-node (with larger dialog for URL display)
+# 5) Update nym-node
 update_nym_node() {
     log "FUNCTION" "update_nym_node"
     
-    # Step 1: Get download URL from user (larger dialog)
+    # Step 1: Get download URL from user
     local download_url
-    download_url=$(dialog --title "Nym-Node Update" --inputbox \
-        "Enter download URL for latest nym-node binary:\n\nExample:\nhttps://github.com/nymtech/nym/releases/download/nym-binaries-v2025.13-emmental/nym-node\n\nOr check: https://github.com/nymtech/nym/releases/latest" \
-        15 90 3>&1 1>&2 2>&3)
-    [[ $? -ne 0 || -z "$download_url" ]] && { show_msg "Cancelled" "Update cancelled."; return; }
+    download_url=$(get_input "Nym-Node Update" "Enter download URL for latest nym-node binary:\n\nExample:\nhttps://github.com/nymtech/nym/releases/download/nym-binaries-v2025.13-emmental/nym-node")
+    [[ -z "$download_url" ]] && { show_msg "Cancelled" "Update cancelled."; return; }
     
     # Step 2: Select nodes to update
     if ! select_multiple_nodes; then
@@ -550,7 +548,7 @@ update_nym_node() {
         node_list+="\n• ${SELECTED_NODES_NAMES[i]} (${SELECTED_NODES_IPS[i]})"
     done
     
-    confirm "Update nym-node on the following ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\nDownload URL:\n$download_url\n\nBinary Path: $BINARY_PATH" || return
+    confirm "Update nym-node on the following ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\nDownload URL:\n$download_url" || return
     
     # Step 5: Process each node
     local results=""
@@ -563,6 +561,46 @@ update_nym_node() {
         local node_name="${SELECTED_NODES_NAMES[i]}"
         local node_ip="${SELECTED_NODES_IPS[i]}"
         ((current++))
+        
+        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nTesting SSH connection..." 6 60
+        
+        # Test SSH connection
+        if ! ssh_exec "$node_ip" "$ssh_user" "$ssh_pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1; then
+            failed_updates+=("$node_name: SSH connection failed")
+            continue
+        fi
+        
+        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nNavigating to $BINARY_PATH..." 6 60
+        
+        # Create binary directory if it doesn't exist and navigate there
+        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "mkdir -p $BINARY_PATH && cd $BINARY_PATH && pwd" "Create Directory" >/dev/null 2>&1; then
+            failed_updates+=("$node_name: Could not access $BINARY_PATH directory")
+            continue
+        fi
+        
+        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nBacking up current binary..." 6 60
+        
+        # Create old directory and backup current binary
+        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "cd $BINARY_PATH && mkdir -p old && if [ -f nym-node ]; then mv nym-node old/nym-node.backup.\$(date +%Y%m%d_%H%M%S) || true; fi" "Backup Binary" >/dev/null 2>&1; then
+            failed_updates+=("$node_name: Could not backup current binary")
+            continue
+        fi
+        
+        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nDownloading new binary..." 6 60
+        
+        # Download new binary
+        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "cd $BINARY_PATH && curl -L -o nym-node '$download_url' && ls -la nym-node" "Download Binary" >/dev/null 2>&1; then
+            failed_updates+=("$node_name: Could not download new binary")
+            continue
+        fi
+        
+        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nMaking binary executable..." 6 60
+        
+        # Make binary executable
+        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "cd $BINARY_PATH && chmod +x nym-node" "Make Executable" >/dev/null 2>&1; then
+            failed_updates+=("$node_name: Could not make binary executable")
+            continue
+        fi
         
         dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nChecking version..." 6 60
         
@@ -691,7 +729,7 @@ toggle_node_functionality() {
         node_list+="\n• ${SELECTED_NODES_NAMES[i]} (${SELECTED_NODES_IPS[i]})"
     done
     
-    confirm "Apply the following configuration to ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\n• Wireguard: $wg_choice\n• Mixnet Mode: $mode_choice\n• Service: $SERVICE_NAME" || return
+    confirm "Apply the following configuration to ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\n• Wireguard: $wg_choice\n• Mixnet Mode: $mode_choice" || return
     
     # Step 6: Process each node
     local results=""
@@ -753,8 +791,7 @@ toggle_node_functionality() {
     
     results+="Applied Configuration:\n"
     results+="   • Wireguard: $wg_choice\n"
-    results+="   • Mixnet Mode: $mode_choice\n"
-    results+="   • Service: $SERVICE_NAME\n\n"
+    results+="   • Mixnet Mode: $mode_choice\n\n"
     results+="⚠️  IMPORTANT: Restart services on successfully updated nodes\n"
     results+="   Use menu option 7 to restart services"
     
@@ -954,14 +991,12 @@ test_ssh() {
         "Root Switch:echo '$pass' | sudo -S su -c 'whoami'"
         "Service File:echo '$pass' | sudo -S test -f /etc/systemd/system/$SERVICE_NAME && echo 'EXISTS'"
         "Systemctl:echo '$pass' | sudo -S systemctl is-active $SERVICE_NAME"
-        "Binary Path:echo '$pass' | sudo -S test -d $BINARY_PATH && echo 'EXISTS'"
-        "Binary File:echo '$pass' | sudo -S test -f $BINARY_PATH/nym-node && echo 'EXISTS'"
     )
     
     local step=1
     for test in "${tests[@]}"; do
         local desc="${test%%:*}" cmd="${test#*:}"
-        dialog --title "SSH Test" --infobox "Step $step/9: Testing $desc..." 5 50
+        dialog --title "SSH Test" --infobox "Step $step/7: Testing $desc..." 5 50
         
         if output=$(ssh_exec "$SELECTED_NODE_IP" "$user" "$pass" "$cmd" "$desc" 2>/dev/null); then
             results+="✅ Step $step: $desc - SUCCESS\n   Result: $output\n"
@@ -971,11 +1006,7 @@ test_ssh() {
         ((step++))
     done
     
-    results+="\nConfiguration Used:\n"
-    results+="• SSH Port: $SSH_PORT\n"
-    results+="• Service Name: $SERVICE_NAME\n"
-    results+="• Binary Path: $BINARY_PATH\n\n"
-    results+="🎯 SSH Test Complete!"
+    results+="\n🎯 SSH Test Complete!"
     show_success "$results"
 }
 
@@ -989,7 +1020,7 @@ show_debug() {
 main_menu() {
     while true; do
         local choice=$(dialog --clear --title "$SCRIPT_NAME v$VERSION" \
-            --menu "Select an option:" 20 70 11 \
+            --menu "Select an option:" 18 70 10 \
             1 "List all nodes" 2 "Add node" 3 "Delete node" 4 "Retrieve node roles" \
             5 "Update nym-node" 6 "Toggle node functionality (Mixnet & Wireguard)" \
             7 "Restart service" 8 "Config" 9 "Test SSH" 10 "Show debug log" 0 "Exit" \
@@ -1015,44 +1046,4 @@ main() {
     check_deps; main_menu
 }
 
-main "$@"total)...\nTesting SSH connection..." 6 60
-        
-        # Test SSH connection
-        if ! ssh_exec "$node_ip" "$ssh_user" "$ssh_pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1; then
-            failed_updates+=("$node_name: SSH connection failed")
-            continue
-        fi
-        
-        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nNavigating to $BINARY_PATH..." 6 60
-        
-        # Create binary directory if it doesn't exist and navigate there
-        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "mkdir -p $BINARY_PATH && cd $BINARY_PATH && pwd" "Create Directory" >/dev/null 2>&1; then
-            failed_updates+=("$node_name: Could not access $BINARY_PATH directory")
-            continue
-        fi
-        
-        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nBacking up current binary..." 6 60
-        
-        # Create old directory and backup current binary
-        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "cd $BINARY_PATH && mkdir -p old && if [ -f nym-node ]; then mv nym-node old/nym-node.backup.\$(date +%Y%m%d_%H%M%S) || true; fi" "Backup Binary" >/dev/null 2>&1; then
-            failed_updates+=("$node_name: Could not backup current binary")
-            continue
-        fi
-        
-        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nDownloading new binary..." 6 60
-        
-        # Download new binary
-        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "cd $BINARY_PATH && curl -L -o nym-node '$download_url' && ls -la nym-node" "Download Binary" >/dev/null 2>&1; then
-            failed_updates+=("$node_name: Could not download new binary")
-            continue
-        fi
-        
-        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nMaking binary executable..." 6 60
-        
-        # Make binary executable
-        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "cd $BINARY_PATH && chmod +x nym-node" "Make Executable" >/dev/null 2>&1; then
-            failed_updates+=("$node_name: Could not make binary executable")
-            continue
-        fi
-        
-        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$
+main "$@"
