@@ -1,12 +1,12 @@
 #!/bin/bash
 
-# Nym Node Manager v40 - Optimized Version
+# Nym Node Manager v45 - Optimized Version
 # Requires: dialog, sshpass, curl
 
 # Colors and config
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 SCRIPT_NAME="Nym Node Manager"
-VERSION="40"
+VERSION="41"
 DEBUG_LOG="debug.log"
 NODES_FILE="$(dirname "${BASH_SOURCE[0]}")/nodes.txt"
 
@@ -185,7 +185,7 @@ list_nodes() {
         case "$line" in
             "Node Name: "*)
                 [[ -n "$current_node" ]] && content+="\n"
-                content+="🖥️ NODE: ${line#Node Name: }\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                content+="🖥️ NODE: ${line#Node Name: }\n────────────────────────────────────────\n"
                 current_node="yes" ;;
             "IP Address: "*) content+="🌐 IP: ${line#IP Address: }\n" ;;
             "Build Version: "*) content+="📦 Version: ${line#Build Version: }\n" ;;
@@ -193,8 +193,8 @@ list_nodes() {
             "Mixnode Enabled: false") content+="🔀 Mixnode: \Z1❌ Disabled\Zn\n" ;;
             "Gateway Enabled: true") content+="🚪 Gateway: \Z2✅ Enabled\Zn\n" ;;
             "Gateway Enabled: false") content+="🚪 Gateway: \Z1❌ Disabled\Zn\n" ;;
-            "Network Requester Enabled: true") content+="🌐 Network Requester: \Z2✅ Enabled\Zn\n" ;;
-            "Network Requester Enabled: false") content+="🌐 Network Requester: \Z1❌ Disabled\Zn\n" ;;
+            "Network Requester Enabled: true") content+="🌍 Network Requester: \Z2✅ Enabled\Zn\n" ;;
+            "Network Requester Enabled: false") content+="🌍 Network Requester: \Z1❌ Disabled\Zn\n" ;;
             "IP Packet Router Enabled: true") content+="📦 IP Packet Router: \Z2✅ Enabled\Zn\n" ;;
             "IP Packet Router Enabled: false") content+="📦 IP Packet Router: \Z1❌ Disabled\Zn\n" ;;
             "Wireguard Status: enabled"*) content+="🔒 WireGuard: \Z2✅ ${line#Wireguard Status: }\Zn\n" ;;
@@ -219,18 +219,89 @@ add_node() {
     show_success "Node '$name' with IP '$ip' added successfully in alphabetical order!"
 }
 
-# 3) Delete node
+# 3) Delete nodes (Multi-selection with "Select All")
 delete_node() {
     log "FUNCTION" "delete_node"
-    select_node || return
+    [[ ! -f "$NODES_FILE" || ! -s "$NODES_FILE" ]] && { show_error "No nodes found. Add nodes first."; return 1; }
     
-    confirm "Delete node: $SELECTED_NODE_NAME ($SELECTED_NODE_IP)?\nThis cannot be undone." || return
+    local options=() names=() ips=() counter=1 name="" ip=""
     
-    local temp=$(mktemp) in_target=false
+    # Parse nodes from file
     while IFS= read -r line; do
         if [[ "$line" =~ ^Node\ Name:\ (.+)$ ]]; then
-            if [[ "${BASH_REMATCH[1]}" == "$SELECTED_NODE_NAME" ]]; then
-                in_target=true; continue
+            name="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^IP\ Address:\ (.+)$ ]]; then
+            ip="${BASH_REMATCH[1]}"
+            if [[ -n "$name" && -n "$ip" ]]; then
+                names+=("$name"); ips+=("$ip")
+                options+=("$counter" "$name ($ip)" "OFF")
+                ((counter++)); name=""; ip=""
+            fi
+        fi
+    done < "$NODES_FILE"
+    
+    [[ ${#names[@]} -eq 0 ]] && { show_error "No valid nodes found."; return 1; }
+    
+    # Add "Select All" option at the beginning
+    local all_options=("ALL" "Select All Nodes" "OFF" "${options[@]}")
+    
+    # Show checklist for multiple selection
+    local choices=$(dialog --title "Select Nodes to Delete" --checklist \
+        "Choose nodes to DELETE (Space to select, Enter to confirm):" \
+        $((${#names[@]} + 10)) 70 $((${#names[@]} + 1)) "${all_options[@]}" 3>&1 1>&2 2>&3)
+    
+    [[ $? -ne 0 ]] && return 1
+    
+    # Parse selections
+    local selected_names=()
+    local selected_ips=()
+    
+    # Process choices
+    for choice in $choices; do
+        choice=$(echo "$choice" | tr -d '"')  # Remove quotes
+        if [[ "$choice" == "ALL" ]]; then
+            # Select all nodes
+            selected_names=("${names[@]}")
+            selected_ips=("${ips[@]}")
+            break
+        else
+            # Individual selection
+            local idx=$((choice - 1))
+            selected_names+=("${names[$idx]}")
+            selected_ips+=("${ips[$idx]}")
+        fi
+    done
+    
+    [[ ${#selected_names[@]} -eq 0 ]] && { show_error "No nodes selected."; return 1; }
+    
+    # Build confirmation message
+    local node_list=""
+    for ((i=0; i<${#selected_names[@]}; i++)); do
+        node_list+="\n• ${selected_names[i]} (${selected_ips[i]})"
+    done
+    
+    confirm "Delete the following ${#selected_names[@]} node(s)?$node_list\n\nThis cannot be undone." || return
+    
+    # Create temporary file to rebuild nodes file
+    local temp=$(mktemp)
+    local in_target=false
+    local current_node_name=""
+    
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^Node\ Name:\ (.+)$ ]]; then
+            current_node_name="${BASH_REMATCH[1]}"
+            # Check if this node should be deleted
+            local should_delete=false
+            for selected_name in "${selected_names[@]}"; do
+                if [[ "$current_node_name" == "$selected_name" ]]; then
+                    should_delete=true
+                    break
+                fi
+            done
+            
+            if [[ "$should_delete" == "true" ]]; then
+                in_target=true
+                continue
             else
                 in_target=false
                 [[ -s "$temp" ]] && echo "" >> "$temp"
@@ -242,7 +313,7 @@ delete_node() {
     done < "$NODES_FILE"
     
     mv "$temp" "$NODES_FILE"
-    show_success "Node '$SELECTED_NODE_NAME' deleted successfully!"
+    show_success "${#selected_names[@]} node(s) deleted successfully!"
 }
 
 # 4) Retrieve node roles
@@ -507,7 +578,7 @@ update_nym_node() {
     done
     
     # Step 6: Display results
-    results="🔄 Nym-Node Update Results\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    results="📄 Nym-Node Update Results\n────────────────────────────────────────────────────\n\n"
     
     if [[ ${#successful_updates[@]} -gt 0 ]]; then
         results+="✅ Successfully Updated (${#successful_updates[@]} nodes):\n"
@@ -558,111 +629,204 @@ get_current_settings() {
     fi
 }
 
-# 6) Toggle node functionality (Combined Mixnet & Wireguard)
+# 6) Toggle node functionality (Multi-selection with "Select All")
 toggle_node_functionality() {
     log "FUNCTION" "toggle_node_functionality"
-    select_node || return
     
-    local user=$(get_input "SSH Connection" "SSH username for $SELECTED_NODE_NAME:")
-    [[ -z "$user" ]] && return
-    local pass=$(get_password "SSH Connection" "SSH password for $user@$SELECTED_NODE_IP:")
-    [[ -z "$pass" ]] && return
-    
-    # Test connection first
-    ssh_exec "$SELECTED_NODE_IP" "$user" "$pass" "echo 'OK'" "Connection Test" >/dev/null || return
-    
-    # Get current settings
-    dialog --title "Node Configuration" --infobox "Reading current configuration..." 5 50
-    get_current_settings "$SELECTED_NODE_IP" "$user" "$pass"
-    
-    # Create radiolist options for Wireguard
-    local wg_options=()
-    if [[ "$CURRENT_WIREGUARD" == "enabled" ]]; then
-        wg_options+=("enabled" "Enable Wireguard" "ON" "disabled" "Disable Wireguard" "OFF")
-    else
-        wg_options+=("enabled" "Enable Wireguard" "OFF" "disabled" "Disable Wireguard" "ON")
-    fi
-    
-    # Get Wireguard choice
-    local wg_choice=$(dialog --title "Wireguard Configuration" --radiolist \
-        "Current Wireguard status: $CURRENT_WIREGUARD\nSelect desired setting:" 12 60 2 \
-        "${wg_options[@]}" 3>&1 1>&2 2>&3)
-    [[ $? -ne 0 ]] && return
-    
-    # Create radiolist options for Mixnet mode
-    local mode_options=()
-    local modes=("entry-gateway" "Entry Gateway" "exit-gateway" "Exit Gateway" "mixnode" "Mixnode")
-    for ((i=0; i<${#modes[@]}; i+=2)); do
-        local mode="${modes[i]}" desc="${modes[i+1]}"
-        if [[ "$CURRENT_MODE" == "$mode" ]]; then
-            mode_options+=("$mode" "$desc" "ON")
-        else
-            mode_options+=("$mode" "$desc" "OFF")
-        fi
-    done
-    
-    # Get Mode choice
-    local mode_choice=$(dialog --title "Mixnet Mode Configuration" --radiolist \
-        "Current mode: $CURRENT_MODE\nSelect desired mode:" 14 60 3 \
-        "${mode_options[@]}" 3>&1 1>&2 2>&3)
-    [[ $? -ne 0 ]] && return
-    
-    # Show confirmation
-    local changes=""
-    [[ "$wg_choice" != "$CURRENT_WIREGUARD" ]] && changes+="• Wireguard: $CURRENT_WIREGUARD → $wg_choice\n"
-    [[ "$mode_choice" != "$CURRENT_MODE" ]] && changes+="• Mixnet Mode: $CURRENT_MODE → $mode_choice\n"
-    
-    if [[ -z "$changes" ]]; then
-        show_msg "No Changes" "No configuration changes were made."
+    # Step 1: Select nodes
+    if ! select_multiple_nodes; then
+        show_msg "Cancelled" "Node selection cancelled."
         return
     fi
     
-    confirm "Apply the following changes to $SELECTED_NODE_NAME?\n\n$changes" || return
-    
-    # Apply changes
-    dialog --title "Applying Changes" --infobox "Updating node configuration..." 5 50
-    
-    # Build sed commands for updates
-    local sed_commands=""
-    
-    # Update Wireguard setting
-    if [[ "$wg_choice" != "$CURRENT_WIREGUARD" ]]; then
-        local wg_flag=$([ "$wg_choice" = "enabled" ] && echo "true" || echo "false")
-        sed_commands+="sed -i 's/--wireguard-enabled [^ ]*/--wireguard-enabled $wg_flag/g; t wireguard_updated; s/\\(ExecStart=[^ ]* run\\)/\\1 --wireguard-enabled $wg_flag/; :wireguard_updated' /etc/systemd/system/nym-node.service && "
-    fi
-    
-    # Update Mode setting
-    if [[ "$mode_choice" != "$CURRENT_MODE" ]]; then
-        sed_commands+="sed -i 's/--mode [^ ]*/--mode $mode_choice/g; t mode_updated; s/\\(ExecStart=[^ ]* run\\)/\\1 --mode $mode_choice/; :mode_updated' /etc/systemd/system/nym-node.service && "
-    fi
-    
-    # Create backup and apply changes
-    local update_cmd="cp /etc/systemd/system/nym-node.service /etc/systemd/system/nym-node.service.backup.\$(date +%Y%m%d_%H%M%S) && ${sed_commands}systemctl daemon-reload"
-    
-    if ssh_root "$SELECTED_NODE_IP" "$user" "$pass" "$update_cmd" "Update Configuration"; then
-        show_success "Configuration updated successfully on $SELECTED_NODE_NAME!\n\n$changes\nRestart the service to apply changes."
-    fi
-}
-
-# 7) Restart service
-restart_service() {
-    log "FUNCTION" "restart_service"
-    select_node || return
-    
-    local user=$(get_input "SSH Connection" "SSH username for $SELECTED_NODE_NAME:")
+    # Step 2: Get SSH credentials (same for all nodes)
+    local user=$(get_input "SSH Connection" "SSH username (same for all selected nodes):")
     [[ -z "$user" ]] && return
-    local pass=$(get_password "SSH Connection" "SSH password for $user@$SELECTED_NODE_IP:")
+    local pass=$(get_password "SSH Connection" "SSH password for $user:")
     [[ -z "$pass" ]] && return
     
-    confirm "Restart nym-node service on $SELECTED_NODE_NAME?" || return
-    
-    dialog --title "Restarting" --infobox "Restarting service..." 5 50
-    
-    if ssh_exec "$SELECTED_NODE_IP" "$user" "$pass" "echo '$pass' | sudo -S systemctl restart nym-node.service" "Restart Service"; then
-        sleep 2
-        local status=$(ssh_exec "$SELECTED_NODE_IP" "$user" "$pass" "sudo systemctl is-active nym-node.service" "Check Status")
-        show_success "Service restarted! Status: $status"
+    # Step 3: Test connection to first node
+    dialog --title "Configuration" --infobox "Testing SSH connection..." 5 50
+    if ! ssh_exec "${SELECTED_NODES_IPS[0]}" "$user" "$pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1; then
+        show_error "SSH connection failed to ${SELECTED_NODES_NAMES[0]}. Please check credentials."
+        return
     fi
+    
+    # Step 4: Get configuration preferences
+    # Wireguard setting
+    local wg_choice=$(dialog --title "Wireguard Configuration" --radiolist \
+        "Select Wireguard setting for all selected nodes:" 12 60 2 \
+        "enabled" "Enable Wireguard" "OFF" \
+        "disabled" "Disable Wireguard" "ON" \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && return
+    
+    # Mixnet mode setting
+    local mode_choice=$(dialog --title "Mixnet Mode Configuration" --radiolist \
+        "Select mode for all selected nodes:" 14 60 3 \
+        "entry-gateway" "Entry Gateway" "OFF" \
+        "exit-gateway" "Exit Gateway" "OFF" \
+        "mixnode" "Mixnode" "ON" \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && return
+    
+    # Step 5: Show confirmation
+    local node_list=""
+    for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
+        node_list+="\n• ${SELECTED_NODES_NAMES[i]} (${SELECTED_NODES_IPS[i]})"
+    done
+    
+    confirm "Apply the following configuration to ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\n• Wireguard: $wg_choice\n• Mixnet Mode: $mode_choice" || return
+    
+    # Step 6: Process each node
+    local results=""
+    local successful_updates=()
+    local failed_updates=()
+    local total=${#SELECTED_NODES_NAMES[@]}
+    local current=0
+    
+    for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
+        local node_name="${SELECTED_NODES_NAMES[i]}"
+        local node_ip="${SELECTED_NODES_IPS[i]}"
+        ((current++))
+        
+        dialog --title "Configuring Nodes" --infobox "Processing $node_name ($current/$total)...\nUpdating configuration..." 6 60
+        
+        # Test SSH connection for each node
+        if ! ssh_exec "$node_ip" "$user" "$pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1; then
+            failed_updates+=("$node_name: SSH connection failed")
+            continue
+        fi
+        
+        # Build sed commands for updates
+        local wg_flag=$([ "$wg_choice" = "enabled" ] && echo "true" || echo "false")
+        local sed_commands=""
+        
+        # Update both Wireguard and Mode settings
+        sed_commands+="sed -i 's/--wireguard-enabled [^ ]*/--wireguard-enabled $wg_flag/g; t wireguard_updated; s/\\(ExecStart=[^ ]* run\\)/\\1 --wireguard-enabled $wg_flag/; :wireguard_updated' /etc/systemd/system/nym-node.service && "
+        sed_commands+="sed -i 's/--mode [^ ]*/--mode $mode_choice/g; t mode_updated; s/\\(ExecStart=[^ ]* run\\)/\\1 --mode $mode_choice/; :mode_updated' /etc/systemd/system/nym-node.service && "
+        
+        # Create backup and apply changes
+        local update_cmd="cp /etc/systemd/system/nym-node.service /etc/systemd/system/nym-node.service.backup.\$(date +%Y%m%d_%H%M%S) && ${sed_commands}systemctl daemon-reload"
+        
+        if ssh_root "$node_ip" "$user" "$pass" "$update_cmd" "Update Configuration" >/dev/null 2>&1; then
+            successful_updates+=("$node_name: Configuration updated successfully")
+            log "CONFIG" "Successfully updated $node_name configuration"
+        else
+            failed_updates+=("$node_name: Failed to update configuration")
+        fi
+    done
+    
+    # Step 7: Display results
+    results="🔧 Node Configuration Results\n────────────────────────────────────────────────────\n\n"
+    
+    if [[ ${#successful_updates[@]} -gt 0 ]]; then
+        results+="✅ Successfully Updated (${#successful_updates[@]} nodes):\n"
+        for update in "${successful_updates[@]}"; do
+            results+="   • $update\n"
+        done
+        results+="\n"
+    fi
+    
+    if [[ ${#failed_updates[@]} -gt 0 ]]; then
+        results+="❌ Failed Updates (${#failed_updates[@]} nodes):\n"
+        for failure in "${failed_updates[@]}"; do
+            results+="   • $failure\n"
+        done
+        results+="\n"
+    fi
+    
+    results+="Applied Configuration:\n"
+    results+="   • Wireguard: $wg_choice\n"
+    results+="   • Mixnet Mode: $mode_choice\n\n"
+    results+="⚠️  IMPORTANT: Restart services on successfully updated nodes\n"
+    results+="   Use menu option 7 to restart services"
+    
+    show_success "$results"
+}
+
+# 7) Restart service (Multi-selection with "Select All")
+restart_service() {
+    log "FUNCTION" "restart_service"
+    
+    # Step 1: Select nodes
+    if ! select_multiple_nodes; then
+        show_msg "Cancelled" "Node selection cancelled."
+        return
+    fi
+    
+    # Step 2: Get SSH credentials (same for all nodes)
+    local user=$(get_input "SSH Connection" "SSH username (same for all selected nodes):")
+    [[ -z "$user" ]] && return
+    local pass=$(get_password "SSH Connection" "SSH password for $user:")
+    [[ -z "$pass" ]] && return
+    
+    # Step 3: Show confirmation
+    local node_list=""
+    for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
+        node_list+="\n• ${SELECTED_NODES_NAMES[i]} (${SELECTED_NODES_IPS[i]})"
+    done
+    
+    confirm "Restart nym-node service on the following ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list" || return
+    
+    # Step 4: Process each node
+    local results=""
+    local successful_restarts=()
+    local failed_restarts=()
+    local total=${#SELECTED_NODES_NAMES[@]}
+    local current=0
+    
+    for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
+        local node_name="${SELECTED_NODES_NAMES[i]}"
+        local node_ip="${SELECTED_NODES_IPS[i]}"
+        ((current++))
+        
+        dialog --title "Restarting Services" --infobox "Processing $node_name ($current/$total)...\nRestarting nym-node service..." 6 60
+        
+        # Test SSH connection
+        if ! ssh_exec "$node_ip" "$user" "$pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1; then
+            failed_restarts+=("$node_name: SSH connection failed")
+            continue
+        fi
+        
+        # Restart service
+        if ssh_exec "$node_ip" "$user" "$pass" "echo '$pass' | sudo -S systemctl restart nym-node.service" "Restart Service" >/dev/null 2>&1; then
+            # Wait a moment and check status
+            sleep 2
+            local status=$(ssh_exec "$node_ip" "$user" "$pass" "sudo systemctl is-active nym-node.service" "Check Status" 2>/dev/null)
+            if [[ -n "$status" ]]; then
+                successful_restarts+=("$node_name: Service restarted (Status: $status)")
+                log "RESTART" "Successfully restarted $node_name service"
+            else
+                successful_restarts+=("$node_name: Service restarted (Status check failed)")
+            fi
+        else
+            failed_restarts+=("$node_name: Failed to restart service")
+        fi
+    done
+    
+    # Step 5: Display results
+    results="🔄 Service Restart Results\n────────────────────────────────────────────────────\n\n"
+    
+    if [[ ${#successful_restarts[@]} -gt 0 ]]; then
+        results+="✅ Successfully Restarted (${#successful_restarts[@]} nodes):\n"
+        for restart in "${successful_restarts[@]}"; do
+            results+="   • $restart\n"
+        done
+        results+="\n"
+    fi
+    
+    if [[ ${#failed_restarts[@]} -gt 0 ]]; then
+        results+="❌ Failed Restarts (${#failed_restarts[@]} nodes):\n"
+        for failure in "${failed_restarts[@]}"; do
+            results+="   • $failure\n"
+        done
+        results+="\n"
+    fi
+    
+    results+="🎯 Service Restart Complete!"
+    
+    show_success "$results"
 }
 
 # 8) Test SSH
@@ -675,7 +839,7 @@ test_ssh() {
     local pass=$(get_password "SSH Test" "SSH password for $user@$SELECTED_NODE_IP:")
     [[ -z "$pass" ]] && return
     
-    local results="🔧 SSH Test Results for $SELECTED_NODE_NAME ($SELECTED_NODE_IP)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    local results="🔧 SSH Test Results for $SELECTED_NODE_NAME ($SELECTED_NODE_IP)\n────────────────────────────────────────────────────\n\n"
     local tests=(
         "Basic Connection:echo 'OK'"
         "Working Directory:pwd"
