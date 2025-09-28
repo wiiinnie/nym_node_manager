@@ -1,14 +1,25 @@
 #!/bin/bash
 
-# Nym Node Manager v45 - Optimized Version
+# Nym Node Manager v46 - Optimized Version with Configuration Management
 # Requires: dialog, sshpass, curl
 
 # Colors and config
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 SCRIPT_NAME="Nym Node Manager"
-VERSION="41"
+VERSION="46"
 DEBUG_LOG="debug.log"
 NODES_FILE="$(dirname "${BASH_SOURCE[0]}")/nodes.txt"
+CONFIG_FILE="$(dirname "${BASH_SOURCE[0]}")/config.txt"
+
+# Default configuration values
+DEFAULT_SSH_PORT="22"
+DEFAULT_SERVICE_NAME="nym-node.service"
+DEFAULT_BINARY_PATH="/root/nym"
+
+# Global configuration variables
+SSH_PORT=""
+SERVICE_NAME=""
+BINARY_PATH=""
 
 # Initialize debug logging
 init_debug() {
@@ -19,6 +30,48 @@ init_debug() {
 log() {
     local level="$1"; shift
     echo "[$(date '+%H:%M:%S')] [$level] $*" >> "$DEBUG_LOG"
+}
+
+# Load configuration from file
+load_config() {
+    # Set defaults
+    SSH_PORT="$DEFAULT_SSH_PORT"
+    SERVICE_NAME="$DEFAULT_SERVICE_NAME"
+    BINARY_PATH="$DEFAULT_BINARY_PATH"
+    
+    # Load from config file if it exists
+    if [[ -f "$CONFIG_FILE" ]]; then
+        while IFS='=' read -r key value; do
+            # Skip empty lines and comments
+            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+            
+            case "$key" in
+                "SSH_PORT") SSH_PORT="$value" ;;
+                "SERVICE_NAME") SERVICE_NAME="$value" ;;
+                "BINARY_PATH") BINARY_PATH="$value" ;;
+            esac
+        done < "$CONFIG_FILE"
+    fi
+    
+    log "CONFIG" "Loaded config - SSH_PORT: $SSH_PORT, SERVICE_NAME: $SERVICE_NAME, BINARY_PATH: $BINARY_PATH"
+}
+
+# Save configuration to file
+save_config() {
+    cat > "$CONFIG_FILE" << EOF
+# Nym Node Manager Configuration File
+# Generated on $(date)
+
+# SSH Port (default: 22)
+SSH_PORT=$SSH_PORT
+
+# Systemd Service Name (default: nym-node.service)
+SERVICE_NAME=$SERVICE_NAME
+
+# Binary Path (default: /root/nym)
+BINARY_PATH=$BINARY_PATH
+EOF
+    log "CONFIG" "Configuration saved to $CONFIG_FILE"
 }
 
 # Check and install dependencies
@@ -147,12 +200,12 @@ insert_node_sorted() {
     mv "$temp" "$NODES_FILE"
 }
 
-# SSH execution with error handling
+# SSH execution with error handling (using configured port)
 ssh_exec() {
     local ip="$1" user="$2" pass="$3" cmd="$4" desc="${5:-SSH Command}"
-    log "SSH" "$desc: $user@$ip - $cmd"
+    log "SSH" "$desc: $user@$ip:$SSH_PORT - $cmd"
     
-    local output=$(sshpass -p "$pass" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    local output=$(sshpass -p "$pass" ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=10 -o BatchMode=no "$user@$ip" "$cmd" 2>&1)
     local exit_code=$?
     
@@ -160,12 +213,12 @@ ssh_exec() {
         echo "$output"
         return 0
     else
-        show_error "$desc Failed\nNode: $ip\nExit Code: $exit_code\nError: $output"
+        show_error "$desc Failed\nNode: $ip:$SSH_PORT\nExit Code: $exit_code\nError: $output"
         return $exit_code
     fi
 }
 
-# Root SSH execution
+# Root SSH execution (using configured service name and binary path)
 ssh_root() {
     local ip="$1" user="$2" pass="$3" cmd="$4" desc="${5:-Root Command}"
     ssh_exec "$ip" "$user" "$pass" "echo '$pass' | sudo -S su -c \"$cmd\"" "$desc"
@@ -465,14 +518,16 @@ select_multiple_nodes() {
     return 0
 }
 
-# 5) Update nym-node
+# 5) Update nym-node (with larger dialog for URL display)
 update_nym_node() {
     log "FUNCTION" "update_nym_node"
     
-    # Step 1: Get download URL from user
+    # Step 1: Get download URL from user (larger dialog)
     local download_url
-    download_url=$(get_input "Nym-Node Update" "Enter download URL for latest nym-node binary:\n\nExample:\nhttps://github.com/nymtech/nym/releases/download/nym-binaries-v2025.13-emmental/nym-node")
-    [[ -z "$download_url" ]] && { show_msg "Cancelled" "Update cancelled."; return; }
+    download_url=$(dialog --title "Nym-Node Update" --inputbox \
+        "Enter download URL for latest nym-node binary:\n\nExample:\nhttps://github.com/nymtech/nym/releases/download/nym-binaries-v2025.13-emmental/nym-node\n\nOr check: https://github.com/nymtech/nym/releases/latest" \
+        15 90 3>&1 1>&2 2>&3)
+    [[ $? -ne 0 || -z "$download_url" ]] && { show_msg "Cancelled" "Update cancelled."; return; }
     
     # Step 2: Select nodes to update
     if ! select_multiple_nodes; then
@@ -495,7 +550,7 @@ update_nym_node() {
         node_list+="\n• ${SELECTED_NODES_NAMES[i]} (${SELECTED_NODES_IPS[i]})"
     done
     
-    confirm "Update nym-node on the following ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\nDownload URL:\n$download_url" || return
+    confirm "Update nym-node on the following ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\nDownload URL:\n$download_url\n\nBinary Path: $BINARY_PATH" || return
     
     # Step 5: Process each node
     local results=""
@@ -509,51 +564,11 @@ update_nym_node() {
         local node_ip="${SELECTED_NODES_IPS[i]}"
         ((current++))
         
-        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nTesting SSH connection..." 6 60
-        
-        # Test SSH connection
-        if ! ssh_exec "$node_ip" "$ssh_user" "$ssh_pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1; then
-            failed_updates+=("$node_name: SSH connection failed")
-            continue
-        fi
-        
-        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nNavigating to /root/nym..." 6 60
-        
-        # Create /root/nym directory if it doesn't exist and navigate there
-        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "mkdir -p /root/nym && cd /root/nym && pwd" "Create Directory" >/dev/null 2>&1; then
-            failed_updates+=("$node_name: Could not access /root/nym directory")
-            continue
-        fi
-        
-        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nBacking up current binary..." 6 60
-        
-        # Create old directory and backup current binary
-        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "cd /root/nym && mkdir -p old && if [ -f nym-node ]; then mv nym-node old/nym-node.backup.\$(date +%Y%m%d_%H%M%S) || true; fi" "Backup Binary" >/dev/null 2>&1; then
-            failed_updates+=("$node_name: Could not backup current binary")
-            continue
-        fi
-        
-        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nDownloading new binary..." 6 60
-        
-        # Download new binary
-        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "cd /root/nym && curl -L -o nym-node '$download_url' && ls -la nym-node" "Download Binary" >/dev/null 2>&1; then
-            failed_updates+=("$node_name: Could not download new binary")
-            continue
-        fi
-        
-        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nMaking binary executable..." 6 60
-        
-        # Make binary executable
-        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "cd /root/nym && chmod +x nym-node" "Make Executable" >/dev/null 2>&1; then
-            failed_updates+=("$node_name: Could not make binary executable")
-            continue
-        fi
-        
         dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nChecking version..." 6 60
         
         # Get version information
         local version_output
-        version_output=$(ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "cd /root/nym && ./nym-node --version" "Check Version" 2>/dev/null)
+        version_output=$(ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "cd $BINARY_PATH && ./nym-node --version" "Check Version" 2>/dev/null)
         
         if [[ $? -ne 0 || -z "$version_output" ]]; then
             failed_updates+=("$node_name: Could not check version of new binary")
@@ -596,9 +611,9 @@ update_nym_node() {
         results+="\n"
     fi
     
-    results+="⚠️  IMPORTANT: Restart nym-node service on successfully updated nodes\n"
+    results+="⚠️  IMPORTANT: Restart $SERVICE_NAME on successfully updated nodes\n"
     results+="   Use menu option 7 to restart services\n\n"
-    results+="📁 Old binaries backed up to /root/nym/old/ for rollback"
+    results+="📁 Old binaries backed up to $BINARY_PATH/old/ for rollback"
     
     show_success "$results"
 }
@@ -606,7 +621,7 @@ update_nym_node() {
 # Get current node settings from service file
 get_current_settings() {
     local ip="$1" user="$2" pass="$3"
-    local service=$(ssh_root "$ip" "$user" "$pass" "cat /etc/systemd/system/nym-node.service" "Read Service" 2>/dev/null)
+    local service=$(ssh_root "$ip" "$user" "$pass" "cat /etc/systemd/system/$SERVICE_NAME" "Read Service" 2>/dev/null)
     
     # Default values
     CURRENT_WIREGUARD="disabled"
@@ -676,7 +691,7 @@ toggle_node_functionality() {
         node_list+="\n• ${SELECTED_NODES_NAMES[i]} (${SELECTED_NODES_IPS[i]})"
     done
     
-    confirm "Apply the following configuration to ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\n• Wireguard: $wg_choice\n• Mixnet Mode: $mode_choice" || return
+    confirm "Apply the following configuration to ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\n• Wireguard: $wg_choice\n• Mixnet Mode: $mode_choice\n• Service: $SERVICE_NAME" || return
     
     # Step 6: Process each node
     local results=""
@@ -703,11 +718,11 @@ toggle_node_functionality() {
         local sed_commands=""
         
         # Update both Wireguard and Mode settings
-        sed_commands+="sed -i 's/--wireguard-enabled [^ ]*/--wireguard-enabled $wg_flag/g; t wireguard_updated; s/\\(ExecStart=[^ ]* run\\)/\\1 --wireguard-enabled $wg_flag/; :wireguard_updated' /etc/systemd/system/nym-node.service && "
-        sed_commands+="sed -i 's/--mode [^ ]*/--mode $mode_choice/g; t mode_updated; s/\\(ExecStart=[^ ]* run\\)/\\1 --mode $mode_choice/; :mode_updated' /etc/systemd/system/nym-node.service && "
+        sed_commands+="sed -i 's/--wireguard-enabled [^ ]*/--wireguard-enabled $wg_flag/g; t wireguard_updated; s/\\(ExecStart=[^ ]* run\\)/\\1 --wireguard-enabled $wg_flag/; :wireguard_updated' /etc/systemd/system/$SERVICE_NAME && "
+        sed_commands+="sed -i 's/--mode [^ ]*/--mode $mode_choice/g; t mode_updated; s/\\(ExecStart=[^ ]* run\\)/\\1 --mode $mode_choice/; :mode_updated' /etc/systemd/system/$SERVICE_NAME && "
         
         # Create backup and apply changes
-        local update_cmd="cp /etc/systemd/system/nym-node.service /etc/systemd/system/nym-node.service.backup.\$(date +%Y%m%d_%H%M%S) && ${sed_commands}systemctl daemon-reload"
+        local update_cmd="cp /etc/systemd/system/$SERVICE_NAME /etc/systemd/system/$SERVICE_NAME.backup.\$(date +%Y%m%d_%H%M%S) && ${sed_commands}systemctl daemon-reload"
         
         if ssh_root "$node_ip" "$user" "$pass" "$update_cmd" "Update Configuration" >/dev/null 2>&1; then
             successful_updates+=("$node_name: Configuration updated successfully")
@@ -738,7 +753,8 @@ toggle_node_functionality() {
     
     results+="Applied Configuration:\n"
     results+="   • Wireguard: $wg_choice\n"
-    results+="   • Mixnet Mode: $mode_choice\n\n"
+    results+="   • Mixnet Mode: $mode_choice\n"
+    results+="   • Service: $SERVICE_NAME\n\n"
     results+="⚠️  IMPORTANT: Restart services on successfully updated nodes\n"
     results+="   Use menu option 7 to restart services"
     
@@ -767,7 +783,7 @@ restart_service() {
         node_list+="\n• ${SELECTED_NODES_NAMES[i]} (${SELECTED_NODES_IPS[i]})"
     done
     
-    confirm "Restart nym-node service on the following ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list" || return
+    confirm "Restart $SERVICE_NAME on the following ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list" || return
     
     # Step 4: Process each node
     local results=""
@@ -781,7 +797,7 @@ restart_service() {
         local node_ip="${SELECTED_NODES_IPS[i]}"
         ((current++))
         
-        dialog --title "Restarting Services" --infobox "Processing $node_name ($current/$total)...\nRestarting nym-node service..." 6 60
+        dialog --title "Restarting Services" --infobox "Processing $node_name ($current/$total)...\nRestarting $SERVICE_NAME..." 6 60
         
         # Test SSH connection
         if ! ssh_exec "$node_ip" "$user" "$pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1; then
@@ -790,10 +806,10 @@ restart_service() {
         fi
         
         # Restart service
-        if ssh_exec "$node_ip" "$user" "$pass" "echo '$pass' | sudo -S systemctl restart nym-node.service" "Restart Service" >/dev/null 2>&1; then
+        if ssh_exec "$node_ip" "$user" "$pass" "echo '$pass' | sudo -S systemctl restart $SERVICE_NAME" "Restart Service" >/dev/null 2>&1; then
             # Wait a moment and check status
             sleep 2
-            local status=$(ssh_exec "$node_ip" "$user" "$pass" "sudo systemctl is-active nym-node.service" "Check Status" 2>/dev/null)
+            local status=$(ssh_exec "$node_ip" "$user" "$pass" "sudo systemctl is-active $SERVICE_NAME" "Check Status" 2>/dev/null)
             if [[ -n "$status" ]]; then
                 successful_restarts+=("$node_name: Service restarted (Status: $status)")
                 log "RESTART" "Successfully restarted $node_name service"
@@ -829,7 +845,97 @@ restart_service() {
     show_success "$results"
 }
 
-# 8) Test SSH
+# 8) Configuration menu
+config_menu() {
+    log "FUNCTION" "config_menu"
+    
+    while true; do
+        local current_config="Current Configuration:\n"
+        current_config+="• SSH Port: $SSH_PORT\n"
+        current_config+="• Service Name: $SERVICE_NAME\n"
+        current_config+="• Binary Path: $BINARY_PATH"
+        
+        local choice=$(dialog --clear --title "Configuration Menu" \
+            --menu "$current_config\n\nSelect configuration option:" 18 70 5 \
+            1 "Custom SSH Port (Current: $SSH_PORT)" \
+            2 "Systemd Service Name (Current: $SERVICE_NAME)" \
+            3 "Custom Binary Folder (Current: $BINARY_PATH)" \
+            4 "Reset to Defaults" \
+            0 "Back to Main Menu" \
+            3>&1 1>&2 2>&3)
+        
+        [[ $? -ne 0 ]] && break
+        
+        case $choice in
+            1) config_ssh_port ;;
+            2) config_service_name ;;
+            3) config_binary_path ;;
+            4) config_reset_defaults ;;
+            0) break ;;
+            *) show_error "Invalid option." ;;
+        esac
+    done
+}
+
+# Configure SSH Port
+config_ssh_port() {
+    local new_port=$(get_input "SSH Port Configuration" "Enter SSH port (current: $SSH_PORT):")
+    [[ -z "$new_port" ]] && return
+    
+    # Validate port number
+    if [[ "$new_port" =~ ^[0-9]+$ ]] && [[ "$new_port" -ge 1 ]] && [[ "$new_port" -le 65535 ]]; then
+        SSH_PORT="$new_port"
+        save_config
+        show_success "SSH port updated to $SSH_PORT"
+        log "CONFIG" "SSH port changed to $SSH_PORT"
+    else
+        show_error "Invalid port number. Please enter a number between 1 and 65535."
+    fi
+}
+
+# Configure Service Name
+config_service_name() {
+    local new_service=$(get_input "Service Name Configuration" "Enter systemd service name (current: $SERVICE_NAME):")
+    [[ -z "$new_service" ]] && return
+    
+    # Add .service extension if not present
+    if [[ "$new_service" != *.service ]]; then
+        new_service="$new_service.service"
+    fi
+    
+    SERVICE_NAME="$new_service"
+    save_config
+    show_success "Service name updated to $SERVICE_NAME"
+    log "CONFIG" "Service name changed to $SERVICE_NAME"
+}
+
+# Configure Binary Path
+config_binary_path() {
+    local new_path=$(get_input "Binary Path Configuration" "Enter binary folder path (current: $BINARY_PATH):")
+    [[ -z "$new_path" ]] && return
+    
+    # Remove trailing slash if present
+    new_path=$(echo "$new_path" | sed 's|/$||')
+    
+    BINARY_PATH="$new_path"
+    save_config
+    show_success "Binary path updated to $BINARY_PATH"
+    log "CONFIG" "Binary path changed to $BINARY_PATH"
+}
+
+# Reset to defaults
+config_reset_defaults() {
+    confirm "Reset all configuration to defaults?\n\nSSH Port: $DEFAULT_SSH_PORT\nService Name: $DEFAULT_SERVICE_NAME\nBinary Path: $DEFAULT_BINARY_PATH" || return
+    
+    SSH_PORT="$DEFAULT_SSH_PORT"
+    SERVICE_NAME="$DEFAULT_SERVICE_NAME"
+    BINARY_PATH="$DEFAULT_BINARY_PATH"
+    save_config
+    show_success "Configuration reset to defaults"
+    log "CONFIG" "Configuration reset to defaults"
+}
+
+# 9) Test SSH
 test_ssh() {
     log "FUNCTION" "test_ssh"
     select_node || return
@@ -839,21 +945,23 @@ test_ssh() {
     local pass=$(get_password "SSH Test" "SSH password for $user@$SELECTED_NODE_IP:")
     [[ -z "$pass" ]] && return
     
-    local results="🔧 SSH Test Results for $SELECTED_NODE_NAME ($SELECTED_NODE_IP)\n────────────────────────────────────────────────────\n\n"
+    local results="🔧 SSH Test Results for $SELECTED_NODE_NAME ($SELECTED_NODE_IP:$SSH_PORT)\n────────────────────────────────────────────────────\n\n"
     local tests=(
         "Basic Connection:echo 'OK'"
         "Working Directory:pwd"
         "User Identity:whoami"
         "Sudo Access:echo '$pass' | sudo -S whoami"
         "Root Switch:echo '$pass' | sudo -S su -c 'whoami'"
-        "Service File:echo '$pass' | sudo -S test -f /etc/systemd/system/nym-node.service && echo 'EXISTS'"
-        "Systemctl:echo '$pass' | sudo -S systemctl is-active nym-node.service"
+        "Service File:echo '$pass' | sudo -S test -f /etc/systemd/system/$SERVICE_NAME && echo 'EXISTS'"
+        "Systemctl:echo '$pass' | sudo -S systemctl is-active $SERVICE_NAME"
+        "Binary Path:echo '$pass' | sudo -S test -d $BINARY_PATH && echo 'EXISTS'"
+        "Binary File:echo '$pass' | sudo -S test -f $BINARY_PATH/nym-node && echo 'EXISTS'"
     )
     
     local step=1
     for test in "${tests[@]}"; do
         local desc="${test%%:*}" cmd="${test#*:}"
-        dialog --title "SSH Test" --infobox "Step $step/7: Testing $desc..." 5 50
+        dialog --title "SSH Test" --infobox "Step $step/9: Testing $desc..." 5 50
         
         if output=$(ssh_exec "$SELECTED_NODE_IP" "$user" "$pass" "$cmd" "$desc" 2>/dev/null); then
             results+="✅ Step $step: $desc - SUCCESS\n   Result: $output\n"
@@ -863,11 +971,15 @@ test_ssh() {
         ((step++))
     done
     
-    results+="\n🎯 SSH Test Complete!"
+    results+="\nConfiguration Used:\n"
+    results+="• SSH Port: $SSH_PORT\n"
+    results+="• Service Name: $SERVICE_NAME\n"
+    results+="• Binary Path: $BINARY_PATH\n\n"
+    results+="🎯 SSH Test Complete!"
     show_success "$results"
 }
 
-# 9) Show debug log
+# 10) Show debug log
 show_debug() {
     [[ -f "$DEBUG_LOG" ]] && dialog --title "Debug Log" --msgbox "$(tail -50 "$DEBUG_LOG")" 25 100 ||
         show_msg "No Log" "Debug log not found."
@@ -877,10 +989,10 @@ show_debug() {
 main_menu() {
     while true; do
         local choice=$(dialog --clear --title "$SCRIPT_NAME v$VERSION" \
-            --menu "Select an option:" 18 70 10 \
+            --menu "Select an option:" 20 70 11 \
             1 "List all nodes" 2 "Add node" 3 "Delete node" 4 "Retrieve node roles" \
             5 "Update nym-node" 6 "Toggle node functionality (Mixnet & Wireguard)" \
-            7 "Restart service" 8 "Test SSH" 9 "Show debug log" 0 "Exit" \
+            7 "Restart service" 8 "Config" 9 "Test SSH" 10 "Show debug log" 0 "Exit" \
             3>&1 1>&2 2>&3)
         
         [[ $? -ne 0 ]] && break
@@ -888,7 +1000,7 @@ main_menu() {
         case $choice in
             1) list_nodes ;; 2) add_node ;; 3) delete_node ;; 4) retrieve_node_roles ;;
             5) update_nym_node ;; 6) toggle_node_functionality ;; 7) restart_service ;;
-            8) test_ssh ;; 9) show_debug ;;
+            8) config_menu ;; 9) test_ssh ;; 10) show_debug ;;
             0) confirm "Exit?" && break ;;
             *) show_error "Invalid option." ;;
         esac
@@ -898,8 +1010,49 @@ main_menu() {
 # Main execution
 main() {
     init_debug; log "MAIN" "Application starting"
+    load_config  # Load configuration on startup
     trap 'clear; echo -e "${GREEN}Thank you for using $SCRIPT_NAME!${NC}"; exit 0' EXIT INT TERM
     check_deps; main_menu
 }
 
-main "$@"
+main "$@"total)...\nTesting SSH connection..." 6 60
+        
+        # Test SSH connection
+        if ! ssh_exec "$node_ip" "$ssh_user" "$ssh_pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1; then
+            failed_updates+=("$node_name: SSH connection failed")
+            continue
+        fi
+        
+        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nNavigating to $BINARY_PATH..." 6 60
+        
+        # Create binary directory if it doesn't exist and navigate there
+        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "mkdir -p $BINARY_PATH && cd $BINARY_PATH && pwd" "Create Directory" >/dev/null 2>&1; then
+            failed_updates+=("$node_name: Could not access $BINARY_PATH directory")
+            continue
+        fi
+        
+        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nBacking up current binary..." 6 60
+        
+        # Create old directory and backup current binary
+        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "cd $BINARY_PATH && mkdir -p old && if [ -f nym-node ]; then mv nym-node old/nym-node.backup.\$(date +%Y%m%d_%H%M%S) || true; fi" "Backup Binary" >/dev/null 2>&1; then
+            failed_updates+=("$node_name: Could not backup current binary")
+            continue
+        fi
+        
+        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nDownloading new binary..." 6 60
+        
+        # Download new binary
+        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "cd $BINARY_PATH && curl -L -o nym-node '$download_url' && ls -la nym-node" "Download Binary" >/dev/null 2>&1; then
+            failed_updates+=("$node_name: Could not download new binary")
+            continue
+        fi
+        
+        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nMaking binary executable..." 6 60
+        
+        # Make binary executable
+        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "cd $BINARY_PATH && chmod +x nym-node" "Make Executable" >/dev/null 2>&1; then
+            failed_updates+=("$node_name: Could not make binary executable")
+            continue
+        fi
+        
+        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$
