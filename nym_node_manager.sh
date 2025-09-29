@@ -1,15 +1,16 @@
 #!/bin/bash
 
-# Nym Node Manager v46 - Optimized Version with Configuration Management
-# Requires: dialog, sshpass, curl
+# Nym Node Manager v47 - Added Node Backup Functionality
+# Requires: dialog, sshpass, curl, zip
 
 # Colors and config
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 SCRIPT_NAME="Nym Node Manager"
-VERSION="46"
+VERSION="47"
 DEBUG_LOG="debug.log"
 NODES_FILE="$(dirname "${BASH_SOURCE[0]}")/nodes.txt"
 CONFIG_FILE="$(dirname "${BASH_SOURCE[0]}")/config.txt"
+SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
 
 # Default configuration values
 DEFAULT_SSH_PORT="22"
@@ -77,7 +78,7 @@ EOF
 # Check and install dependencies
 check_deps() {
     local missing=()
-    for cmd in dialog sshpass curl; do
+    for cmd in dialog sshpass curl zip; do
         command -v "$cmd" >/dev/null || missing+=("$cmd")
     done
     
@@ -247,8 +248,8 @@ list_nodes() {
             "Mixnode Enabled: false") content+="🔀 Mixnode: \Z1❌ Disabled\Zn\n" ;;
             "Gateway Enabled: true") content+="🚪 Gateway: \Z2✅ Enabled\Zn\n" ;;
             "Gateway Enabled: false") content+="🚪 Gateway: \Z1❌ Disabled\Zn\n" ;;
-            "Network Requester Enabled: true") content+="🌍 Network Requester: \Z2✅ Enabled\Zn\n" ;;
-            "Network Requester Enabled: false") content+="🌍 Network Requester: \Z1❌ Disabled\Zn\n" ;;
+            "Network Requester Enabled: true") content+="🌐 Network Requester: \Z2✅ Enabled\Zn\n" ;;
+            "Network Requester Enabled: false") content+="🌐 Network Requester: \Z1❌ Disabled\Zn\n" ;;
             "IP Packet Router Enabled: true") content+="📦 IP Packet Router: \Z2✅ Enabled\Zn\n" ;;
             "IP Packet Router Enabled: false") content+="📦 IP Packet Router: \Z1❌ Disabled\Zn\n" ;;
             "Wireguard Status: enabled"*) content+="🔒 WireGuard: \Z2✅ ${line#Wireguard Status: }\Zn\n" ;;
@@ -594,7 +595,7 @@ select_multiple_nodes() {
             local idx=$((choice - 1))
             SELECTED_NODES_NAMES+=("${names[$idx]}")
             SELECTED_NODES_IPS+=("${ips[$idx]}")
-            SELECTED_NODES_IDS+=("${node_ids[$idx]}")
+            SELECTED_NODES_IDS+=("${node_ids[@]}")
         fi
     done
     
@@ -602,7 +603,134 @@ select_multiple_nodes() {
     return 0
 }
 
-# 6) Update nym-node
+# 6) Backup node
+backup_node() {
+    log "FUNCTION" "backup_node"
+    
+    # Step 1: Get backup destination directory
+    local backup_dir=$(get_input "Backup Destination" "Enter local backup directory path:\n(Leave empty to use script directory: $SCRIPT_DIR)")
+    
+    # Use script directory if empty
+    if [[ -z "$backup_dir" ]]; then
+        backup_dir="$SCRIPT_DIR"
+    fi
+    
+    # Validate and create directory if needed
+    if [[ ! -d "$backup_dir" ]]; then
+        dialog --title "Create Directory" --infobox "Creating backup directory: $backup_dir..." 5 60
+        if ! mkdir -p "$backup_dir" 2>/dev/null; then
+            show_error "Cannot create backup directory: $backup_dir"
+            return
+        fi
+    fi
+    
+    # Make path absolute
+    backup_dir=$(cd "$backup_dir" && pwd)
+    
+    # Step 2: Select nodes to backup
+    if ! select_multiple_nodes; then
+        show_msg "Cancelled" "Node selection cancelled."
+        return
+    fi
+    
+    # Step 3: Get SSH credentials
+    local ssh_user
+    ssh_user=$(get_input "SSH Connection" "Enter SSH username (same for all selected nodes):")
+    [[ -z "$ssh_user" ]] && { show_msg "Cancelled" "Backup cancelled."; return; }
+    
+    local ssh_pass
+    ssh_pass=$(get_password "SSH Connection" "Enter SSH password for $ssh_user:")
+    [[ -z "$ssh_pass" ]] && { show_msg "Cancelled" "Backup cancelled."; return; }
+    
+    # Step 4: Confirm backup
+    local node_list=""
+    for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
+        node_list+="\n• ${SELECTED_NODES_NAMES[i]} (${SELECTED_NODES_IPS[i]})"
+    done
+    
+    confirm "Backup the following ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\nBackup destination:\n$backup_dir" || return
+    
+    # Step 5: Process each node
+    local results=""
+    local successful_backups=()
+    local failed_backups=()
+    local total=${#SELECTED_NODES_NAMES[@]}
+    local current=0
+    local timestamp=$(date +%Y%m%d)
+    
+    for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
+        local node_name="${SELECTED_NODES_NAMES[i]}"
+        local node_ip="${SELECTED_NODES_IPS[i]}"
+        ((current++))
+        
+        dialog --title "Backing Up Nodes" --infobox "Processing $node_name ($current/$total)...\nTesting SSH connection..." 6 60
+        
+        # Test SSH connection
+        if ! ssh_exec "$node_ip" "$ssh_user" "$ssh_pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1; then
+            failed_backups+=("$node_name: SSH connection failed")
+            continue
+        fi
+        
+        # Generate backup filename
+        local backup_filename="${timestamp}_${node_name}_backup.zip"
+        local remote_backup_path="/tmp/$backup_filename"
+        
+        dialog --title "Backing Up Nodes" --infobox "Processing $node_name ($current/$total)...\nCreating backup archive on remote server..." 7 60
+        
+        # Create zip archive on remote server (excluding .bloom files)
+        local zip_cmd="cd /root && zip -r $remote_backup_path .nym -x '*.bloom'"
+        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "$zip_cmd" "Create Backup Archive" >/dev/null 2>&1; then
+            failed_backups+=("$node_name: Failed to create backup archive")
+            continue
+        fi
+        
+        dialog --title "Backing Up Nodes" --infobox "Processing $node_name ($current/$total)...\nTransferring backup to local machine..." 7 60
+        
+        # Copy backup from remote to local using scp
+        if sshpass -p "$ssh_pass" scp -P "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "$ssh_user@$node_ip:$remote_backup_path" "$backup_dir/$backup_filename" 2>/dev/null; then
+            
+            # Get file size for confirmation
+            local file_size=$(ls -lh "$backup_dir/$backup_filename" 2>/dev/null | awk '{print $5}')
+            
+            # Cleanup remote backup file
+            ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "rm -f $remote_backup_path" "Cleanup Remote Backup" >/dev/null 2>&1
+            
+            successful_backups+=("$node_name: Backup completed ($file_size) -> $backup_filename")
+            log "BACKUP" "Successfully backed up $node_name to $backup_dir/$backup_filename"
+        else
+            failed_backups+=("$node_name: Failed to transfer backup file")
+            # Try to cleanup remote file even if transfer failed
+            ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "rm -f $remote_backup_path" "Cleanup Remote Backup" >/dev/null 2>&1
+        fi
+    done
+    
+    # Step 6: Display results
+    results="💾 Node Backup Results\n────────────────────────────────────────────────────────\n\n"
+    
+    if [[ ${#successful_backups[@]} -gt 0 ]]; then
+        results+="✅ Successfully Backed Up (${#successful_backups[@]} nodes):\n"
+        for backup in "${successful_backups[@]}"; do
+            results+="   • $backup\n"
+        done
+        results+="\n"
+    fi
+    
+    if [[ ${#failed_backups[@]} -gt 0 ]]; then
+        results+="❌ Failed Backups (${#failed_backups[@]} nodes):\n"
+        for failure in "${failed_backups[@]}"; do
+            results+="   • $failure\n"
+        done
+        results+="\n"
+    fi
+    
+    results+="📁 Backup Location: $backup_dir\n"
+    results+="📝 Note: .bloom files excluded from backup"
+    
+    show_success "$results"
+}
+
+# 7) Update nym-node
 update_nym_node() {
     log "FUNCTION" "update_nym_node"
     
@@ -715,7 +843,7 @@ update_nym_node() {
     done
     
     # Step 6: Display results
-    results="📄 Nym-Node Update Results\n────────────────────────────────────────────────────\n\n"
+    results="📄 Nym-Node Update Results\n────────────────────────────────────────────────────────\n\n"
     
     if [[ ${#successful_updates[@]} -gt 0 ]]; then
         results+="✅ Successfully Updated (${#successful_updates[@]} nodes):\n"
@@ -734,8 +862,8 @@ update_nym_node() {
     fi
     
     results+="⚠️  IMPORTANT: Restart $SERVICE_NAME on successfully updated nodes\n"
-    results+="   Use menu option 7 to restart services\n\n"
-    results+="📁 Old binaries backed up to $BINARY_PATH/old/ for rollback"
+    results+="   Use menu option 9 to restart services\n\n"
+    results+="💾 Old binaries backed up to $BINARY_PATH/old/ for rollback"
     
     show_success "$results"
 }
@@ -766,7 +894,7 @@ get_current_settings() {
     fi
 }
 
-# 7) Toggle node functionality (Multi-selection with "Select All") - Enhanced with config.toml support
+# 8) Toggle node functionality (Multi-selection with "Select All") - Enhanced with config.toml support
 toggle_node_functionality() {
     log "FUNCTION" "toggle_node_functionality"
     
@@ -919,7 +1047,7 @@ toggle_node_functionality() {
     done
     
     # Step 7: Display results
-    results="🔧 Node Configuration Results\n────────────────────────────────────────────────────\n\n"
+    results="🔧 Node Configuration Results\n────────────────────────────────────────────────────────\n\n"
     
     if [[ ${#successful_updates[@]} -gt 0 ]]; then
         results+="✅ Successfully Updated (${#successful_updates[@]} nodes):\n"
@@ -941,12 +1069,12 @@ toggle_node_functionality() {
     results+="   • Wireguard: $wg_choice\n"
     results+="   • Mixnet Mode: $mode_choice\n\n"
     results+="⚠️  IMPORTANT: Restart services on successfully updated nodes\n"
-    results+="   Use menu option 8 to restart services"
+    results+="   Use menu option 9 to restart services"
     
     show_success "$results"
 }
 
-# 8) Restart service (Multi-selection with "Select All")
+# 9) Restart service (Multi-selection with "Select All")
 restart_service() {
     log "FUNCTION" "restart_service"
     
@@ -1007,7 +1135,7 @@ restart_service() {
     done
     
     # Step 5: Display results
-    results="🔄 Service Restart Results\n────────────────────────────────────────────────────\n\n"
+    results="🔄 Service Restart Results\n────────────────────────────────────────────────────────\n\n"
     
     if [[ ${#successful_restarts[@]} -gt 0 ]]; then
         results+="✅ Successfully Restarted (${#successful_restarts[@]} nodes):\n"
@@ -1030,7 +1158,7 @@ restart_service() {
     show_success "$results"
 }
 
-# 9) Configuration menu
+# 10) Configuration menu
 config_menu() {
     log "FUNCTION" "config_menu"
     
@@ -1120,7 +1248,7 @@ config_reset_defaults() {
     log "CONFIG" "Configuration reset to defaults"
 }
 
-# 10) Test SSH
+# 11) Test SSH
 test_ssh() {
     log "FUNCTION" "test_ssh"
     select_node || return
@@ -1130,7 +1258,7 @@ test_ssh() {
     local pass=$(get_password "SSH Test" "SSH password for $user@$SELECTED_NODE_IP:")
     [[ -z "$pass" ]] && return
     
-    local results="🔧 SSH Test Results for $SELECTED_NODE_NAME ($SELECTED_NODE_IP:$SSH_PORT)\n────────────────────────────────────────────────────\n\n"
+    local results="🔧 SSH Test Results for $SELECTED_NODE_NAME ($SELECTED_NODE_IP:$SSH_PORT)\n────────────────────────────────────────────────────────\n\n"
     local tests=(
         "Basic Connection:echo 'OK'"
         "Working Directory:pwd"
@@ -1158,7 +1286,7 @@ test_ssh() {
     show_success "$results"
 }
 
-# 11) Show debug log
+# 12) Show debug log
 show_debug() {
     [[ -f "$DEBUG_LOG" ]] && dialog --title "Debug Log" --msgbox "$(tail -50 "$DEBUG_LOG")" 25 100 ||
         show_msg "No Log" "Debug log not found."
@@ -1168,20 +1296,20 @@ show_debug() {
 main_menu() {
     while true; do
         local choice=$(dialog --clear --title "$SCRIPT_NAME v$VERSION" \
-            --menu "Select an option:" 20 70 12 \
+            --menu "Select an option:" 22 70 14 \
             1 "List all nodes" 2 "Add node" 3 "Edit node" 4 "Delete node" \
-            5 "Retrieve node roles" 6 "Update nym-node" \
-            7 "Toggle node functionality (Mixnet & Wireguard)" \
-            8 "Restart service" 9 "Config" 10 "Test SSH" 11 "Show debug log" 0 "Exit" \
+            5 "Retrieve node roles" 6 "Backup node" 7 "Update nym-node" \
+            8 "Toggle node functionality (Mixnet & Wireguard)" \
+            9 "Restart service" 10 "Config" 11 "Test SSH" 12 "Show debug log" 0 "Exit" \
             3>&1 1>&2 2>&3)
         
         [[ $? -ne 0 ]] && break
         
         case $choice in
             1) list_nodes ;; 2) add_node ;; 3) edit_node ;; 4) delete_node ;;
-            5) retrieve_node_roles ;; 6) update_nym_node ;; 
-            7) toggle_node_functionality ;; 8) restart_service ;;
-            9) config_menu ;; 10) test_ssh ;; 11) show_debug ;;
+            5) retrieve_node_roles ;; 6) backup_node ;; 7) update_nym_node ;; 
+            8) toggle_node_functionality ;; 9) restart_service ;;
+            10) config_menu ;; 11) test_ssh ;; 12) show_debug ;;
             0) confirm "Exit?" && break ;;
             *) show_error "Invalid option." ;;
         esac
