@@ -1,12 +1,12 @@
 #!/bin/bash
 
-# Nym Node Manager v47 - Added Node Backup Functionality
-# Requires: dialog, sshpass, curl, zip
+# Nym Node Manager v48 - Using tar for backups (universally available)
+# Requires: dialog, sshpass, curl
 
 # Colors and config
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 SCRIPT_NAME="Nym Node Manager"
-VERSION="47"
+VERSION="48"
 DEBUG_LOG="debug.log"
 NODES_FILE="$(dirname "${BASH_SOURCE[0]}")/nodes.txt"
 CONFIG_FILE="$(dirname "${BASH_SOURCE[0]}")/config.txt"
@@ -78,7 +78,7 @@ EOF
 # Check and install dependencies
 check_deps() {
     local missing=()
-    for cmd in dialog sshpass curl zip; do
+    for cmd in dialog sshpass curl; do
         command -v "$cmd" >/dev/null || missing+=("$cmd")
     done
     
@@ -204,7 +204,10 @@ insert_node_sorted() {
 # SSH execution with error handling (using configured port)
 ssh_exec() {
     local ip="$1" user="$2" pass="$3" cmd="$4" desc="${5:-SSH Command}"
-    log "SSH" "$desc: $user@$ip:$SSH_PORT - $cmd"
+    
+    # Sanitize command for logging (replace password with asterisks)
+    local safe_cmd=$(echo "$cmd" | sed "s/${pass//\//\\/}/***REDACTED***/g")
+    log "SSH" "$desc: $user@$ip:$SSH_PORT - $safe_cmd"
     
     local output=$(sshpass -p "$pass" ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=10 -o BatchMode=no "$user@$ip" "$cmd" 2>&1)
@@ -672,14 +675,14 @@ backup_node() {
         fi
         
         # Generate backup filename
-        local backup_filename="${timestamp}_${node_name}_backup.zip"
+        local backup_filename="${timestamp}_${node_name}_backup.tar.gz"
         local remote_backup_path="/tmp/$backup_filename"
         
         dialog --title "Backing Up Nodes" --infobox "Processing $node_name ($current/$total)...\nCreating backup archive on remote server..." 7 60
         
-        # Create zip archive on remote server (excluding .bloom files)
-        local zip_cmd="cd /root && zip -r $remote_backup_path .nym -x '*.bloom'"
-        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "$zip_cmd" "Create Backup Archive" >/dev/null 2>&1; then
+        # Create tar.gz archive on remote server (excluding .bloom files)
+        local tar_cmd="cd /root && tar --exclude='*.bloom' -czf $remote_backup_path .nym 2>/dev/null"
+        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "$tar_cmd" "Create Backup Archive" >/dev/null 2>&1; then
             failed_backups+=("$node_name: Failed to create backup archive")
             continue
         fi
