@@ -1,81 +1,108 @@
 #!/bin/bash
 
-# Nym Node Manager v48 - Using tar for backups (universally available)
-# Requires: dialog, sshpass, curl
+# ============================================================================
+# Nym Node Manager v51 - Optimized & Refactored
+# ============================================================================
+# Description: Centralized management tool for Nym network nodes
+# Requirements: dialog, sshpass, curl
+# Features: Multi-node operations, backup, updates, configuration management
+# ============================================================================
 
-# Colors and config
+# ----------------------------------------------------------------------------
+# GLOBAL CONFIGURATION
+# ----------------------------------------------------------------------------
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 SCRIPT_NAME="Nym Node Manager"
-VERSION="48"
-DEBUG_LOG="debug.log"
-NODES_FILE="$(dirname "${BASH_SOURCE[0]}")/nodes.txt"
-CONFIG_FILE="$(dirname "${BASH_SOURCE[0]}")/config.txt"
+VERSION="51"
 SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
+DEBUG_LOG="$SCRIPT_DIR/debug.log"
+NODES_FILE="$SCRIPT_DIR/nodes.txt"
+CONFIG_FILE="$SCRIPT_DIR/config.txt"
 
-# Default configuration values
+# Default configuration
 DEFAULT_SSH_PORT="22"
 DEFAULT_SERVICE_NAME="nym-node.service"
 DEFAULT_BINARY_PATH="/root/nym"
 
-# Global configuration variables
+# Runtime configuration (loaded from config file)
 SSH_PORT=""
 SERVICE_NAME=""
 BINARY_PATH=""
 
+# Node selection arrays (global for multi-node operations)
+SELECTED_NODES_NAMES=()
+SELECTED_NODES_IPS=()
+SELECTED_NODES_IDS=()
+
+# ----------------------------------------------------------------------------
+# UTILITY FUNCTIONS - Logging & Initialization
+# ----------------------------------------------------------------------------
+
 # Initialize debug logging
+# Creates new log file with session header
 init_debug() {
-    echo "=== Nym Node Manager Started - $(date) - User: $(whoami) ===" > "$DEBUG_LOG"
+    echo "=== Nym Node Manager v$VERSION Started - $(date) - User: $(whoami) ===" > "$DEBUG_LOG"
 }
 
 # Unified logging function
+# Args: $1=level, $@=message
 log() {
     local level="$1"; shift
     echo "[$(date '+%H:%M:%S')] [$level] $*" >> "$DEBUG_LOG"
 }
 
-# Load configuration from file
+# ----------------------------------------------------------------------------
+# UTILITY FUNCTIONS - Dialog Wrappers
+# ----------------------------------------------------------------------------
+
+show_msg() { dialog --title "$1" --msgbox "$2" 10 60; }
+show_error() { log "ERROR" "$1"; show_msg "Error" "$1"; }
+show_success() { log "SUCCESS" "$1"; show_msg "Success" "$1"; }
+confirm() { dialog --title "Confirm" --yesno "$1" 8 50; }
+get_input() { dialog --title "$1" --inputbox "$2" 8 50 3>&1 1>&2 2>&3; }
+get_password() { dialog --title "$1" --passwordbox "$2" 8 50 3>&1 1>&2 2>&3; }
+
+# ----------------------------------------------------------------------------
+# UTILITY FUNCTIONS - Configuration Management
+# ----------------------------------------------------------------------------
+
+# Load configuration from file or use defaults
+# Sets global variables: SSH_PORT, SERVICE_NAME, BINARY_PATH
 load_config() {
-    # Set defaults
     SSH_PORT="$DEFAULT_SSH_PORT"
     SERVICE_NAME="$DEFAULT_SERVICE_NAME"
     BINARY_PATH="$DEFAULT_BINARY_PATH"
     
-    # Load from config file if it exists
-    if [[ -f "$CONFIG_FILE" ]]; then
-        while IFS='=' read -r key value; do
-            # Skip empty lines and comments
-            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
-            
-            case "$key" in
-                "SSH_PORT") SSH_PORT="$value" ;;
-                "SERVICE_NAME") SERVICE_NAME="$value" ;;
-                "BINARY_PATH") BINARY_PATH="$value" ;;
-            esac
-        done < "$CONFIG_FILE"
-    fi
+    [[ ! -f "$CONFIG_FILE" ]] && return
     
-    log "CONFIG" "Loaded config - SSH_PORT: $SSH_PORT, SERVICE_NAME: $SERVICE_NAME, BINARY_PATH: $BINARY_PATH"
+    while IFS='=' read -r key value; do
+        [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+        case "$key" in
+            "SSH_PORT") SSH_PORT="$value" ;;
+            "SERVICE_NAME") SERVICE_NAME="$value" ;;
+            "BINARY_PATH") BINARY_PATH="$value" ;;
+        esac
+    done < "$CONFIG_FILE"
+    
+    log "CONFIG" "Loaded - SSH_PORT:$SSH_PORT SERVICE_NAME:$SERVICE_NAME BINARY_PATH:$BINARY_PATH"
 }
 
-# Save configuration to file
+# Save current configuration to file
 save_config() {
     cat > "$CONFIG_FILE" << EOF
-# Nym Node Manager Configuration File
-# Generated on $(date)
-
-# SSH Port (default: 22)
+# Nym Node Manager Configuration - Generated $(date)
 SSH_PORT=$SSH_PORT
-
-# Systemd Service Name (default: nym-node.service)
 SERVICE_NAME=$SERVICE_NAME
-
-# Binary Path (default: /root/nym)
 BINARY_PATH=$BINARY_PATH
 EOF
-    log "CONFIG" "Configuration saved to $CONFIG_FILE"
+    log "CONFIG" "Configuration saved"
 }
 
-# Check and install dependencies
+# ----------------------------------------------------------------------------
+# UTILITY FUNCTIONS - Dependencies
+# ----------------------------------------------------------------------------
+
+# Check and install missing dependencies
 check_deps() {
     local missing=()
     for cmd in dialog sshpass curl; do
@@ -94,23 +121,64 @@ check_deps() {
     fi
 }
 
-# Unified dialog functions
-show_msg() { dialog --title "$1" --msgbox "$2" 10 60; }
-show_error() { log "ERROR" "$1"; show_msg "Error" "$1"; }
-show_success() { log "SUCCESS" "$1"; show_msg "Success" "$1"; }
-confirm() { dialog --title "Confirm" --yesno "$1" 8 50; }
-get_input() { dialog --title "$1" --inputbox "$2" 8 50 3>&1 1>&2 2>&3; }
-get_password() { dialog --title "$1" --passwordbox "$2" 8 50 3>&1 1>&2 2>&3; }
+# ----------------------------------------------------------------------------
+# NODE FILE OPERATIONS - Parsing & Sorting
+# ----------------------------------------------------------------------------
 
-# Sort nodes in file alphabetically
+# Check if node name already exists
+# Args: $1=name to check
+# Returns: 0 if exists, 1 if not exists
+node_name_exists() {
+    local check_name="$1"
+    
+    [[ ! -f "$NODES_FILE" || ! -s "$NODES_FILE" ]] && return 1
+    
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^Node\ Name:\ (.+)$ ]]; then
+            local existing_name="${BASH_REMATCH[1]}"
+            [[ "$existing_name" == "$check_name" ]] && return 0
+        fi
+    done < "$NODES_FILE"
+    
+    return 1
+}
+
+# Parse nodes file into structured arrays
+# Returns via global arrays: names, ips, node_ids
+# Usage: parse_nodes_file
+parse_nodes_file() {
+    names=(); ips=(); node_ids=()
+    
+    [[ ! -f "$NODES_FILE" || ! -s "$NODES_FILE" ]] && return 1
+    
+    local name="" ip="" node_id=""
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^Node\ Name:\ (.+)$ ]]; then
+            name="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^IP\ Address:\ (.+)$ ]]; then
+            ip="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^Node\ ID:\ (.+)$ ]]; then
+            node_id="${BASH_REMATCH[1]}"
+            if [[ -n "$name" && -n "$ip" && -n "$node_id" ]]; then
+                names+=("$name")
+                ips+=("$ip")
+                node_ids+=("$node_id")
+                name=""; ip=""; node_id=""
+            fi
+        fi
+    done < "$NODES_FILE"
+    
+    [[ ${#names[@]} -eq 0 ]] && return 1
+    return 0
+}
+
+# Sort nodes file alphabetically by name
 sort_nodes_file() {
     [[ ! -f "$NODES_FILE" || ! -s "$NODES_FILE" ]] && return
     
     local temp=$(mktemp)
-    local nodes=()
-    local current_node=""
+    local nodes=() current_node=""
     
-    # Read all nodes into array
     while IFS= read -r line; do
         if [[ "$line" =~ ^Node\ Name:\ (.+)$ ]]; then
             [[ -n "$current_node" ]] && nodes+=("$current_node")
@@ -121,10 +189,8 @@ sort_nodes_file() {
     done < "$NODES_FILE"
     [[ -n "$current_node" ]] && nodes+=("$current_node")
     
-    # Sort nodes by name
     IFS=$'\n' sorted=($(printf '%s\n' "${nodes[@]}" | sort -t: -k2))
     
-    # Write sorted nodes back
     for ((i=0; i<${#sorted[@]}; i++)); do
         [[ $i -gt 0 ]] && echo >> "$temp"
         echo -e "${sorted[i]}" | sed '/^$/d' >> "$temp"
@@ -133,42 +199,11 @@ sort_nodes_file() {
     mv "$temp" "$NODES_FILE"
 }
 
-# Node selection helper
-select_node() {
-    [[ ! -f "$NODES_FILE" || ! -s "$NODES_FILE" ]] && { show_error "No nodes found. Add nodes first."; return 1; }
-    
-    local options=() names=() ips=() counter=1 name="" ip=""
-    
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^Node\ Name:\ (.+)$ ]]; then
-            name="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^IP\ Address:\ (.+)$ ]]; then
-            ip="${BASH_REMATCH[1]}"
-            if [[ -n "$name" && -n "$ip" ]]; then
-                names+=("$name"); ips+=("$ip")
-                options+=("$counter" "$name ($ip)")
-                ((counter++)); name=""; ip=""
-            fi
-        fi
-    done < "$NODES_FILE"
-    
-    [[ ${#names[@]} -eq 0 ]] && { show_error "No valid nodes found."; return 1; }
-    
-    local choice=$(dialog --title "Select Node" --menu "Choose node:" 15 60 10 "${options[@]}" 3>&1 1>&2 2>&3)
-    [[ $? -ne 0 ]] && return 1
-    
-    local idx=$((choice - 1))
-    SELECTED_NODE_NAME="${names[$idx]}"
-    SELECTED_NODE_IP="${ips[$idx]}"
-    return 0
-}
-
-# Insert node in correct alphabetical position
+# Insert node in alphabetically correct position
+# Args: $1=name, $2=ip, $3=node_id
 insert_node_sorted() {
     local new_name="$1" new_ip="$2" new_node_id="$3"
-    local temp=$(mktemp)
-    local inserted=false
-    local current_node="" in_node=false
+    local temp=$(mktemp) inserted=false
     
     if [[ ! -f "$NODES_FILE" ]]; then
         echo -e "Node Name: $new_name\nIP Address: $new_ip\nNode ID: $new_node_id" > "$NODES_FILE"
@@ -185,14 +220,10 @@ insert_node_sorted() {
                 inserted=true
             fi
             [[ -s "$temp" ]] && echo >> "$temp"
-            echo "$line" >> "$temp"
-            in_node=true
-        else
-            echo "$line" >> "$temp"
         fi
+        echo "$line" >> "$temp"
     done < "$NODES_FILE"
     
-    # If not inserted yet, add at end
     if [[ "$inserted" == "false" ]]; then
         [[ -s "$temp" ]] && echo >> "$temp"
         echo -e "Node Name: $new_name\nIP Address: $new_ip\nNode ID: $new_node_id" >> "$temp"
@@ -201,11 +232,47 @@ insert_node_sorted() {
     mv "$temp" "$NODES_FILE"
 }
 
-# SSH execution with error handling (using configured port)
-ssh_exec() {
-    local ip="$1" user="$2" pass="$3" cmd="$4" desc="${5:-SSH Command}"
+# Remove nodes by name from file
+# Args: $@ = array of node names to remove
+remove_nodes_from_file() {
+    local nodes_to_remove=("$@")
+    local temp=$(mktemp) in_target=false current_name=""
     
-    # Sanitize command for logging (replace password with asterisks)
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^Node\ Name:\ (.+)$ ]]; then
+            current_name="${BASH_REMATCH[1]}"
+            in_target=false
+            for target in "${nodes_to_remove[@]}"; do
+                [[ "$current_name" == "$target" ]] && { in_target=true; break; }
+            done
+            
+            if [[ ! "$in_target" == "true" ]]; then
+                [[ -s "$temp" ]] && echo "" >> "$temp"
+                echo "$line" >> "$temp"
+            fi
+        elif [[ ! "$in_target" == "true" ]]; then
+            echo "$line" >> "$temp"
+        fi
+    done < "$NODES_FILE"
+    
+    mv "$temp" "$NODES_FILE"
+}
+
+# ----------------------------------------------------------------------------
+# SSH OPERATIONS - Unified SSH execution
+# ----------------------------------------------------------------------------
+
+# Unified SSH execution with optional sudo/root elevation
+# Args: $1=ip, $2=user, $3=pass, $4=command, $5=description, $6=use_root(true/false)
+ssh_exec() {
+    local ip="$1" user="$2" pass="$3" cmd="$4" desc="${5:-SSH Command}" use_root="${6:-false}"
+    
+    # Build command with root elevation if requested
+    if [[ "$use_root" == "true" ]]; then
+        cmd="echo '$pass' | sudo -S su -c \"$cmd\""
+    fi
+    
+    # Sanitize for logging
     local safe_cmd=$(echo "$cmd" | sed "s/${pass//\//\\/}/***REDACTED***/g")
     log "SSH" "$desc: $user@$ip:$SSH_PORT - $safe_cmd"
     
@@ -222,19 +289,109 @@ ssh_exec() {
     fi
 }
 
-# Root SSH execution (using configured service name and binary path)
-ssh_root() {
-    local ip="$1" user="$2" pass="$3" cmd="$4" desc="${5:-Root Command}"
-    ssh_exec "$ip" "$user" "$pass" "echo '$pass' | sudo -S su -c \"$cmd\"" "$desc"
+# ----------------------------------------------------------------------------
+# NODE SELECTION - Unified selection dialog
+# ----------------------------------------------------------------------------
+
+# Select single or multiple nodes with optional "Select All"
+# Args: $1=mode ("single" or "multi"), $2=title
+# Returns: 0 on success, 1 on cancel/error
+# Sets global: SELECTED_NODES_NAMES, SELECTED_NODES_IPS, SELECTED_NODES_IDS
+select_nodes() {
+    local mode="${1:-single}" title="${2:-Select Node}"
+    
+    SELECTED_NODES_NAMES=(); SELECTED_NODES_IPS=(); SELECTED_NODES_IDS=()
+    
+    local names=() ips=() node_ids=()
+    parse_nodes_file || { show_error "No nodes found. Add nodes first."; return 1; }
+    
+    local options=() counter=1
+    for ((i=0; i<${#names[@]}; i++)); do
+        if [[ "$mode" == "multi" ]]; then
+            options+=("$counter" "${names[i]} (${ips[i]})" "OFF")
+        else
+            options+=("$counter" "${names[i]} (${ips[i]})")
+        fi
+        ((counter++))
+    done
+    
+    local choices
+    if [[ "$mode" == "multi" ]]; then
+        local all_options=("ALL" "Select All Nodes" "OFF" "${options[@]}")
+        choices=$(dialog --title "$title" --checklist \
+            "Choose nodes (Space to select, Enter to confirm):" \
+            $((${#names[@]} + 10)) 70 $((${#names[@]} + 1)) "${all_options[@]}" 3>&1 1>&2 2>&3)
+    else
+        choices=$(dialog --title "$title" --menu "Choose node:" 15 60 10 "${options[@]}" 3>&1 1>&2 2>&3)
+    fi
+    
+    [[ $? -ne 0 ]] && return 1
+    
+    # Parse selections
+    for choice in $choices; do
+        choice=$(echo "$choice" | tr -d '"')
+        if [[ "$choice" == "ALL" ]]; then
+            SELECTED_NODES_NAMES=("${names[@]}")
+            SELECTED_NODES_IPS=("${ips[@]}")
+            SELECTED_NODES_IDS=("${node_ids[@]}")
+            break
+        else
+            local idx=$((choice - 1))
+            SELECTED_NODES_NAMES+=("${names[$idx]}")
+            SELECTED_NODES_IPS+=("${ips[$idx]}")
+            SELECTED_NODES_IDS+=("${node_ids[$idx]}")
+        fi
+    done
+    
+    [[ ${#SELECTED_NODES_NAMES[@]} -eq 0 ]] && { show_error "No nodes selected."; return 1; }
+    return 0
 }
 
-# 1) List all nodes (sorted alphabetically)
+# ----------------------------------------------------------------------------
+# RESULTS DISPLAY - Unified results formatting
+# ----------------------------------------------------------------------------
+
+# Display operation results in consistent format
+# Args: $1=operation_name, $2=success_array_name, $3=fail_array_name, $4=additional_info
+show_operation_results() {
+    local operation="$1"
+    local -n success_arr="$2"
+    local -n fail_arr="$3"
+    local additional="${4:-}"
+    
+    local results="$operation Results\n"
+    results+="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    if [[ ${#success_arr[@]} -gt 0 ]]; then
+        results+="✅ Success (${#success_arr[@]} nodes):\n"
+        for item in "${success_arr[@]}"; do
+            results+="   • $item\n"
+        done
+        results+="\n"
+    fi
+    
+    if [[ ${#fail_arr[@]} -gt 0 ]]; then
+        results+="❌ Failed (${#fail_arr[@]} nodes):\n"
+        for item in "${fail_arr[@]}"; do
+            results+="   • $item\n"
+        done
+        results+="\n"
+    fi
+    
+    [[ -n "$additional" ]] && results+="$additional\n"
+    
+    show_success "$results"
+}
+
+# ----------------------------------------------------------------------------
+# NODE MANAGEMENT FUNCTIONS
+# ----------------------------------------------------------------------------
+
+# List all nodes with their configuration
 list_nodes() {
     log "FUNCTION" "list_nodes"
-    [[ ! -f "$NODES_FILE" ]] && { show_msg "No Nodes" "No nodes.txt file found."; return; }
-    [[ ! -s "$NODES_FILE" ]] && { show_msg "No Nodes" "The nodes.txt file is empty."; return; }
+    [[ ! -f "$NODES_FILE" || ! -s "$NODES_FILE" ]] && { show_msg "No Nodes" "No nodes found."; return; }
     
-    # Ensure file is sorted before display
     sort_nodes_file
     
     local content="" current_node=""
@@ -242,7 +399,7 @@ list_nodes() {
         case "$line" in
             "Node Name: "*)
                 [[ -n "$current_node" ]] && content+="\n"
-                content+="🖥️ NODE: ${line#Node Name: }\n────────────────────────────────────────\n"
+                content+="🖥️ NODE: ${line#Node Name: }\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 current_node="yes" ;;
             "IP Address: "*) content+="🌐 IP: ${line#IP Address: }\n" ;;
             "Node ID: "*) content+="🆔 ID: ${line#Node ID: }\n" ;;
@@ -260,284 +417,193 @@ list_nodes() {
         esac
     done < "$NODES_FILE"
     
-    [[ -n "$content" ]] && dialog --title "Nym Network Nodes (Alphabetically Sorted)" --colors --msgbox "$content" 25 85 ||
+    [[ -n "$content" ]] && dialog --title "Nym Network Nodes" --colors --msgbox "$content" 25 85 ||
         show_msg "No Data" "No readable node data found."
 }
 
-# 2) Add node (insert in sorted order) - Now includes Node ID
+# Add new node
 add_node() {
     log "FUNCTION" "add_node"
-    local name=$(get_input "Add New Node" "Enter Node Name:")
-    [[ -z "$name" ]] && { show_msg "Cancelled" "Node creation cancelled."; return; }
     
-    local ip=$(get_input "Add New Node" "Enter IP Address for '$name':")
+    local name=""
+    local attempt=0
+    
+    # Loop until valid unique name is provided or user cancels
+    while true; do
+        ((attempt++))
+        
+        if [[ $attempt -eq 1 ]]; then
+            name=$(get_input "Add Node" "Enter Node Name:")
+        else
+            name=$(get_input "Add Node" "Node '$name' already exists!\n\nEnter a different Node Name:")
+        fi
+        
+        # Check if user cancelled
+        [[ -z "$name" ]] && { show_msg "Cancelled" "Node creation cancelled."; return; }
+        
+        # Check if name already exists
+        if node_name_exists "$name"; then
+            log "ADD_NODE" "Duplicate name attempt: $name"
+            continue  # Loop back to ask for new name
+        else
+            break  # Name is unique, proceed
+        fi
+    done
+    
+    local ip=$(get_input "Add Node" "Enter IP Address for '$name':")
     [[ -z "$ip" ]] && { show_msg "Cancelled" "Node creation cancelled."; return; }
     
-    local node_id=$(get_input "Add New Node" "Enter Node ID for '$name':\n(The ID you used during node initialization)")
+    local node_id=$(get_input "Add Node" "Enter Node ID for '$name':\n(The ID used during node initialization)")
     [[ -z "$node_id" ]] && { show_msg "Cancelled" "Node creation cancelled."; return; }
     
     insert_node_sorted "$name" "$ip" "$node_id"
-    show_success "Node '$name' with IP '$ip' and ID '$node_id' added successfully!"
+    show_success "Node '$name' added successfully!\nIP: $ip\nID: $node_id"
+    log "ADD_NODE" "Successfully added node: $name"
 }
 
-# 3) Edit node
+# Edit existing node
 edit_node() {
     log "FUNCTION" "edit_node"
-    [[ ! -f "$NODES_FILE" || ! -s "$NODES_FILE" ]] && { show_error "No nodes found. Add nodes first."; return 1; }
     
-    local options=() names=() ips=() node_ids=() counter=1 name="" ip="" node_id=""
+    select_nodes "single" "Edit Node" || return
     
-    # Parse nodes from file
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^Node\ Name:\ (.+)$ ]]; then
-            name="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^IP\ Address:\ (.+)$ ]]; then
-            ip="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^Node\ ID:\ (.+)$ ]]; then
-            node_id="${BASH_REMATCH[1]}"
-            if [[ -n "$name" && -n "$ip" && -n "$node_id" ]]; then
-                names+=("$name"); ips+=("$ip"); node_ids+=("$node_id")
-                options+=("$counter" "$name ($ip)")
-                ((counter++)); name=""; ip=""; node_id=""
-            fi
+    local old_name="${SELECTED_NODES_NAMES[0]}"
+    local old_ip="${SELECTED_NODES_IPS[0]}"
+    local old_id="${SELECTED_NODES_IDS[0]}"
+    
+    local new_name=""
+    local attempt=0
+    
+    # Loop until valid unique name is provided or user cancels
+    while true; do
+        ((attempt++))
+        
+        if [[ $attempt -eq 1 ]]; then
+            new_name=$(dialog --title "Edit Node Name" --inputbox "Enter new Node Name:" 8 50 "$old_name" 3>&1 1>&2 2>&3)
+        else
+            new_name=$(dialog --title "Edit Node Name" --inputbox "Node '$new_name' already exists!\n\nEnter a different Node Name:" 8 50 "$old_name" 3>&1 1>&2 2>&3)
         fi
-    done < "$NODES_FILE"
-    
-    [[ ${#names[@]} -eq 0 ]] && { show_error "No valid nodes found."; return 1; }
-    
-    local choice=$(dialog --title "Edit Node" --menu "Choose node to edit:" 15 60 10 "${options[@]}" 3>&1 1>&2 2>&3)
-    [[ $? -ne 0 ]] && return 1
-    
-    local idx=$((choice - 1))
-    local old_name="${names[$idx]}"
-    local old_ip="${ips[$idx]}"
-    local old_node_id="${node_ids[$idx]}"
-    
-    # Get new values
-    local new_name=$(dialog --title "Edit Node Name" --inputbox "Enter new Node Name:" 8 50 "$old_name" 3>&1 1>&2 2>&3)
-    [[ $? -ne 0 || -z "$new_name" ]] && { show_msg "Cancelled" "Edit cancelled."; return; }
+        
+        # Check if user cancelled
+        [[ $? -ne 0 || -z "$new_name" ]] && { show_msg "Cancelled" "Edit cancelled."; return; }
+        
+        # Allow keeping the same name (editing same node)
+        if [[ "$new_name" == "$old_name" ]]; then
+            break
+        fi
+        
+        # Check if new name already exists
+        if node_name_exists "$new_name"; then
+            log "EDIT_NODE" "Duplicate name attempt: $new_name"
+            continue  # Loop back to ask for new name
+        else
+            break  # Name is unique, proceed
+        fi
+    done
     
     local new_ip=$(dialog --title "Edit IP Address" --inputbox "Enter new IP Address:" 8 50 "$old_ip" 3>&1 1>&2 2>&3)
     [[ $? -ne 0 || -z "$new_ip" ]] && { show_msg "Cancelled" "Edit cancelled."; return; }
     
-    local new_node_id=$(dialog --title "Edit Node ID" --inputbox "Enter new Node ID:" 8 50 "$old_node_id" 3>&1 1>&2 2>&3)
-    [[ $? -ne 0 || -z "$new_node_id" ]] && { show_msg "Cancelled" "Edit cancelled."; return; }
+    local new_id=$(dialog --title "Edit Node ID" --inputbox "Enter new Node ID:" 8 50 "$old_id" 3>&1 1>&2 2>&3)
+    [[ $? -ne 0 || -z "$new_id" ]] && { show_msg "Cancelled" "Edit cancelled."; return; }
     
-    # Remove old node entry and add updated one
-    local temp=$(mktemp)
-    local in_target=false
-    local current_node_name=""
+    remove_nodes_from_file "$old_name"
+    insert_node_sorted "$new_name" "$new_ip" "$new_id"
     
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^Node\ Name:\ (.+)$ ]]; then
-            current_node_name="${BASH_REMATCH[1]}"
-            if [[ "$current_node_name" == "$old_name" ]]; then
-                in_target=true
-                continue
-            else
-                in_target=false
-                [[ -s "$temp" ]] && echo "" >> "$temp"
-                echo "$line" >> "$temp"
-            fi
-        elif [[ ! "$in_target" == "true" ]]; then
-            echo "$line" >> "$temp"
-        fi
-    done < "$NODES_FILE"
-    
-    mv "$temp" "$NODES_FILE"
-    
-    # Insert updated node in correct position
-    insert_node_sorted "$new_name" "$new_ip" "$new_node_id"
-    
-    show_success "Node updated successfully!\n\nOld: $old_name ($old_ip) - $old_node_id\nNew: $new_name ($new_ip) - $new_node_id"
+    show_success "Node updated!\n\nOld: $old_name ($old_ip) - $old_id\nNew: $new_name ($new_ip) - $new_id"
+    log "EDIT_NODE" "Successfully edited: $old_name -> $new_name"
 }
 
-# 4) Delete nodes (Multi-selection with "Select All")
+# Delete nodes with multi-selection
 delete_node() {
     log "FUNCTION" "delete_node"
-    [[ ! -f "$NODES_FILE" || ! -s "$NODES_FILE" ]] && { show_error "No nodes found. Add nodes first."; return 1; }
     
-    local options=() names=() ips=() counter=1 name="" ip=""
+    select_nodes "multi" "Delete Nodes" || return
     
-    # Parse nodes from file
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^Node\ Name:\ (.+)$ ]]; then
-            name="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^IP\ Address:\ (.+)$ ]]; then
-            ip="${BASH_REMATCH[1]}"
-            if [[ -n "$name" && -n "$ip" ]]; then
-                names+=("$name"); ips+=("$ip")
-                options+=("$counter" "$name ($ip)" "OFF")
-                ((counter++)); name=""; ip=""
-            fi
-        fi
-    done < "$NODES_FILE"
-    
-    [[ ${#names[@]} -eq 0 ]] && { show_error "No valid nodes found."; return 1; }
-    
-    # Add "Select All" option at the beginning
-    local all_options=("ALL" "Select All Nodes" "OFF" "${options[@]}")
-    
-    # Show checklist for multiple selection
-    local choices=$(dialog --title "Select Nodes to Delete" --checklist \
-        "Choose nodes to DELETE (Space to select, Enter to confirm):" \
-        $((${#names[@]} + 10)) 70 $((${#names[@]} + 1)) "${all_options[@]}" 3>&1 1>&2 2>&3)
-    
-    [[ $? -ne 0 ]] && return 1
-    
-    # Parse selections
-    local selected_names=()
-    local selected_ips=()
-    
-    # Process choices
-    for choice in $choices; do
-        choice=$(echo "$choice" | tr -d '"')  # Remove quotes
-        if [[ "$choice" == "ALL" ]]; then
-            # Select all nodes
-            selected_names=("${names[@]}")
-            selected_ips=("${ips[@]}")
-            break
-        else
-            # Individual selection
-            local idx=$((choice - 1))
-            selected_names+=("${names[$idx]}")
-            selected_ips+=("${ips[$idx]}")
-        fi
-    done
-    
-    [[ ${#selected_names[@]} -eq 0 ]] && { show_error "No nodes selected."; return 1; }
-    
-    # Build confirmation message
     local node_list=""
-    for ((i=0; i<${#selected_names[@]}; i++)); do
-        node_list+="\n• ${selected_names[i]} (${selected_ips[i]})"
+    for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
+        node_list+="\n• ${SELECTED_NODES_NAMES[i]} (${SELECTED_NODES_IPS[i]})"
     done
     
-    confirm "Delete the following ${#selected_names[@]} node(s)?$node_list\n\nThis cannot be undone." || return
+    confirm "Delete ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\nThis cannot be undone." || return
     
-    # Create temporary file to rebuild nodes file
-    local temp=$(mktemp)
-    local in_target=false
-    local current_node_name=""
-    
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^Node\ Name:\ (.+)$ ]]; then
-            current_node_name="${BASH_REMATCH[1]}"
-            # Check if this node should be deleted
-            local should_delete=false
-            for selected_name in "${selected_names[@]}"; do
-                if [[ "$current_node_name" == "$selected_name" ]]; then
-                    should_delete=true
-                    break
-                fi
-            done
-            
-            if [[ "$should_delete" == "true" ]]; then
-                in_target=true
-                continue
-            else
-                in_target=false
-                [[ -s "$temp" ]] && echo "" >> "$temp"
-                echo "$line" >> "$temp"
-            fi
-        elif [[ ! "$in_target" == "true" ]]; then
-            echo "$line" >> "$temp"
-        fi
-    done < "$NODES_FILE"
-    
-    mv "$temp" "$NODES_FILE"
-    show_success "${#selected_names[@]} node(s) deleted successfully!"
+    remove_nodes_from_file "${SELECTED_NODES_NAMES[@]}"
+    show_success "${#SELECTED_NODES_NAMES[@]} node(s) deleted successfully!"
 }
 
-# 5) Retrieve node roles
+# ----------------------------------------------------------------------------
+# NODE OPERATIONS FUNCTIONS
+# ----------------------------------------------------------------------------
+
+# Retrieve node roles from API
 retrieve_node_roles() {
     log "FUNCTION" "retrieve_node_roles"
     [[ ! -f "$NODES_FILE" || ! -s "$NODES_FILE" ]] && { show_error "No nodes found."; return; }
     
-    # First, create a clean file with only Node Name, IP Address and Node ID lines
+    # Clean file - keep only Node Name, IP, and Node ID
     local clean_file=$(mktemp)
     while IFS= read -r line; do
-        if [[ "$line" =~ ^(Node\ Name:|IP\ Address:|Node\ ID:) ]] || [[ -z "$line" ]]; then
-            echo "$line" >> "$clean_file"
-        fi
+        [[ "$line" =~ ^(Node\ Name:|IP\ Address:|Node\ ID:) || -z "$line" ]] && echo "$line" >> "$clean_file"
     done < "$NODES_FILE"
     
-    # Count nodes for progress
-    local count=$(grep -c "^Node Name:" "$clean_file")
-    local processed=0
+    local names=() ips=() node_ids=()
+    parse_nodes_file
+    local total=${#names[@]} processed=0
     
-    dialog --title "Retrieving Roles" --infobox "Processing 0/$count nodes..." 6 40 &
+    dialog --title "Retrieving Roles" --infobox "Processing 0/$total nodes..." 6 40 &
     local dialog_pid=$!
     
-    # Now process the clean file and add fresh role data
     local temp=$(mktemp)
-    local name="" ip="" node_id=""
-    
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^Node\ Name:\ (.+)$ ]]; then
-            name="${BASH_REMATCH[1]}"
-            echo "$line" >> "$temp"
-        elif [[ "$line" =~ ^IP\ Address:\ (.+)$ ]]; then
-            ip="${BASH_REMATCH[1]}"
-            echo "$line" >> "$temp"
-        elif [[ "$line" =~ ^Node\ ID:\ (.+)$ ]]; then
-            node_id="${BASH_REMATCH[1]}"
-            echo "$line" >> "$temp"
-            
-            # Process this node if we have all info
-            if [[ -n "$name" && -n "$ip" && -n "$node_id" ]]; then
-                ((processed++))
-                kill $dialog_pid 2>/dev/null
-                dialog --title "Retrieving Roles" --infobox "Processing $name ($processed/$count)..." 6 50 &
-                dialog_pid=$!
-                
-                # Get data from APIs
-                local roles=$(curl -s --connect-timeout 5 --max-time 10 "http://$ip:8080/api/v1/roles" 2>/dev/null)
-                local gateway=$(curl -s --connect-timeout 5 --max-time 10 "http://$ip:8080/api/v1/gateway" 2>/dev/null)
-                local build_info=$(curl -s --connect-timeout 5 --max-time 10 "http://$ip:8080/api/v1/build-information" 2>/dev/null)
-                
-                # Add fresh role information
-                if [[ -n "$roles" ]]; then
-                    echo "Mixnode Enabled: $(echo "$roles" | grep -o '"mixnode_enabled"[[:space:]]*:[[:space:]]*[^,}]*' | cut -d':' -f2 | tr -d ' ",' || echo "unknown")" >> "$temp"
-                    echo "Gateway Enabled: $(echo "$roles" | grep -o '"gateway_enabled"[[:space:]]*:[[:space:]]*[^,}]*' | cut -d':' -f2 | tr -d ' ",' || echo "unknown")" >> "$temp"
-                    echo "Network Requester Enabled: $(echo "$roles" | grep -o '"network_requester_enabled"[[:space:]]*:[[:space:]]*[^,}]*' | cut -d':' -f2 | tr -d ' ",' || echo "unknown")" >> "$temp"
-                    echo "IP Packet Router Enabled: $(echo "$roles" | grep -o '"ip_packet_router_enabled"[[:space:]]*:[[:space:]]*[^,}]*' | cut -d':' -f2 | tr -d ' ",' || echo "unknown")" >> "$temp"
-                else
-                    echo -e "Mixnode Enabled: error\nGateway Enabled: error\nNetwork Requester Enabled: error\nIP Packet Router Enabled: error" >> "$temp"
-                fi
-                
-                # Parse Wireguard status
-                if [[ -n "$gateway" ]]; then
-                    if echo "$gateway" | grep -q '"wireguard"[[:space:]]*:[[:space:]]*null'; then
-                        echo "Wireguard Status: disabled" >> "$temp"
-                    elif echo "$gateway" | grep -q '"wireguard"[[:space:]]*:[[:space:]]*{'; then
-                        local port=$(echo "$gateway" | grep -o '"port"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*')
-                        echo "Wireguard Status: enabled${port:+ (port: $port)}" >> "$temp"
-                    else
-                        echo "Wireguard Status: unknown" >> "$temp"
-                    fi
-                else
-                    echo "Wireguard Status: error" >> "$temp"
-                fi
-                
-                # Parse build version
-                if [[ -n "$build_info" ]]; then
-                    local version=$(echo "$build_info" | grep -o '"build_version"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d':' -f2 | tr -d ' "' || echo "unknown")
-                    echo "Build Version: $version" >> "$temp"
-                else
-                    echo "Build Version: error" >> "$temp"
-                fi
-                
-                # Reset for next node
-                name=""; ip=""; node_id=""
+    for ((i=0; i<total; i++)); do
+        local name="${names[i]}" ip="${ips[i]}" node_id="${node_ids[i]}"
+        ((processed++))
+        
+        kill $dialog_pid 2>/dev/null
+        dialog --title "Retrieving Roles" --infobox "Processing $name ($processed/$total)..." 6 50 &
+        dialog_pid=$!
+        
+        echo -e "Node Name: $name\nIP Address: $ip\nNode ID: $node_id" >> "$temp"
+        
+        # Fetch API data
+        local roles=$(curl -s --connect-timeout 5 --max-time 10 "http://$ip:8080/api/v1/roles" 2>/dev/null)
+        local gateway=$(curl -s --connect-timeout 5 --max-time 10 "http://$ip:8080/api/v1/gateway" 2>/dev/null)
+        local build_info=$(curl -s --connect-timeout 5 --max-time 10 "http://$ip:8080/api/v1/build-information" 2>/dev/null)
+        
+        # Parse and add role information
+        if [[ -n "$roles" ]]; then
+            echo "Mixnode Enabled: $(echo "$roles" | grep -o '"mixnode_enabled"[[:space:]]*:[[:space:]]*[^,}]*' | cut -d':' -f2 | tr -d ' ",' || echo "unknown")" >> "$temp"
+            echo "Gateway Enabled: $(echo "$roles" | grep -o '"gateway_enabled"[[:space:]]*:[[:space:]]*[^,}]*' | cut -d':' -f2 | tr -d ' ",' || echo "unknown")" >> "$temp"
+            echo "Network Requester Enabled: $(echo "$roles" | grep -o '"network_requester_enabled"[[:space:]]*:[[:space:]]*[^,}]*' | cut -d':' -f2 | tr -d ' ",' || echo "unknown")" >> "$temp"
+            echo "IP Packet Router Enabled: $(echo "$roles" | grep -o '"ip_packet_router_enabled"[[:space:]]*:[[:space:]]*[^,}]*' | cut -d':' -f2 | tr -d ' ",' || echo "unknown")" >> "$temp"
+        else
+            echo -e "Mixnode Enabled: error\nGateway Enabled: error\nNetwork Requester Enabled: error\nIP Packet Router Enabled: error" >> "$temp"
+        fi
+        
+        # Parse Wireguard
+        if [[ -n "$gateway" ]]; then
+            if echo "$gateway" | grep -q '"wireguard"[[:space:]]*:[[:space:]]*null'; then
+                echo "Wireguard Status: disabled" >> "$temp"
+            elif echo "$gateway" | grep -q '"wireguard"[[:space:]]*:[[:space:]]*{'; then
+                local port=$(echo "$gateway" | grep -o '"port"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*')
+                echo "Wireguard Status: enabled${port:+ (port: $port)}" >> "$temp"
+            else
+                echo "Wireguard Status: unknown" >> "$temp"
             fi
         else
-            # Copy blank lines
-            echo "$line" >> "$temp"
+            echo "Wireguard Status: error" >> "$temp"
         fi
-    done < "$clean_file"
+        
+        # Parse version
+        if [[ -n "$build_info" ]]; then
+            local version=$(echo "$build_info" | grep -o '"build_version"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d':' -f2 | tr -d ' "' || echo "unknown")
+            echo "Build Version: $version" >> "$temp"
+        else
+            echo "Build Version: error" >> "$temp"
+        fi
+        
+        [[ $i -lt $((total - 1)) ]] && echo >> "$temp"
+    done
     
-    # Cleanup
     kill $dialog_pid 2>/dev/null
     rm -f "$clean_file"
     mv "$temp" "$NODES_FILE"
@@ -545,634 +611,304 @@ retrieve_node_roles() {
     show_success "Node roles retrieved for $processed nodes!"
 }
 
-# Multi-node selection helper
-select_multiple_nodes() {
-    [[ ! -f "$NODES_FILE" || ! -s "$NODES_FILE" ]] && { show_error "No nodes found. Add nodes first."; return 1; }
-    
-    local options=() names=() ips=() node_ids=() counter=1 name="" ip="" node_id=""
-    
-    # Parse nodes from file
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^Node\ Name:\ (.+)$ ]]; then
-            name="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^IP\ Address:\ (.+)$ ]]; then
-            ip="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^Node\ ID:\ (.+)$ ]]; then
-            node_id="${BASH_REMATCH[1]}"
-            if [[ -n "$name" && -n "$ip" && -n "$node_id" ]]; then
-                names+=("$name"); ips+=("$ip"); node_ids+=("$node_id")
-                options+=("$counter" "$name ($ip)" "OFF")
-                ((counter++)); name=""; ip=""; node_id=""
-            fi
-        fi
-    done < "$NODES_FILE"
-    
-    [[ ${#names[@]} -eq 0 ]] && { show_error "No valid nodes found."; return 1; }
-    
-    # Add "Select All" option at the beginning
-    local all_options=("ALL" "Select All Nodes" "OFF" "${options[@]}")
-    
-    # Show checklist for multiple selection
-    local choices=$(dialog --title "Select Nodes to Update" --checklist \
-        "Choose nodes to update (Space to select, Enter to confirm):" \
-        $((${#names[@]} + 10)) 70 $((${#names[@]} + 1)) "${all_options[@]}" 3>&1 1>&2 2>&3)
-    
-    [[ $? -ne 0 ]] && return 1
-    
-    # Parse selections
-    SELECTED_NODES_NAMES=()
-    SELECTED_NODES_IPS=()
-    SELECTED_NODES_IDS=()
-    
-    # Process choices
-    for choice in $choices; do
-        choice=$(echo "$choice" | tr -d '"')  # Remove quotes
-        if [[ "$choice" == "ALL" ]]; then
-            # Select all nodes
-            SELECTED_NODES_NAMES=("${names[@]}")
-            SELECTED_NODES_IPS=("${ips[@]}")
-            SELECTED_NODES_IDS=("${node_ids[@]}")
-            break
-        else
-            # Individual selection
-            local idx=$((choice - 1))
-            SELECTED_NODES_NAMES+=("${names[$idx]}")
-            SELECTED_NODES_IPS+=("${ips[$idx]}")
-            SELECTED_NODES_IDS+=("${node_ids[@]}")
-        fi
-    done
-    
-    [[ ${#SELECTED_NODES_NAMES[@]} -eq 0 ]] && { show_error "No nodes selected."; return 1; }
-    return 0
-}
-
-# 6) Backup node
+# Backup nodes to local directory
 backup_node() {
     log "FUNCTION" "backup_node"
     
-    # Step 1: Get backup destination directory
-    local backup_dir=$(get_input "Backup Destination" "Enter local backup directory path:\n(Leave empty to use script directory: $SCRIPT_DIR)")
+    local backup_dir=$(get_input "Backup Destination" "Enter local backup directory:\n(Leave empty for: $SCRIPT_DIR)")
+    [[ -z "$backup_dir" ]] && backup_dir="$SCRIPT_DIR"
     
-    # Use script directory if empty
-    if [[ -z "$backup_dir" ]]; then
-        backup_dir="$SCRIPT_DIR"
-    fi
-    
-    # Validate and create directory if needed
     if [[ ! -d "$backup_dir" ]]; then
-        dialog --title "Create Directory" --infobox "Creating backup directory: $backup_dir..." 5 60
-        if ! mkdir -p "$backup_dir" 2>/dev/null; then
-            show_error "Cannot create backup directory: $backup_dir"
-            return
-        fi
+        dialog --title "Create Directory" --infobox "Creating: $backup_dir..." 5 60
+        mkdir -p "$backup_dir" 2>/dev/null || { show_error "Cannot create: $backup_dir"; return; }
     fi
-    
-    # Make path absolute
     backup_dir=$(cd "$backup_dir" && pwd)
     
-    # Step 2: Select nodes to backup
-    if ! select_multiple_nodes; then
-        show_msg "Cancelled" "Node selection cancelled."
-        return
-    fi
+    select_nodes "multi" "Backup Nodes" || return
     
-    # Step 3: Get SSH credentials
-    local ssh_user
-    ssh_user=$(get_input "SSH Connection" "Enter SSH username (same for all selected nodes):")
-    [[ -z "$ssh_user" ]] && { show_msg "Cancelled" "Backup cancelled."; return; }
+    local user=$(get_input "SSH Connection" "SSH username (same for all):")
+    [[ -z "$user" ]] && { show_msg "Cancelled" "Backup cancelled."; return; }
     
-    local ssh_pass
-    ssh_pass=$(get_password "SSH Connection" "Enter SSH password for $ssh_user:")
-    [[ -z "$ssh_pass" ]] && { show_msg "Cancelled" "Backup cancelled."; return; }
+    local pass=$(get_password "SSH Connection" "SSH password for $user:")
+    [[ -z "$pass" ]] && { show_msg "Cancelled" "Backup cancelled."; return; }
     
-    # Step 4: Confirm backup
     local node_list=""
     for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
         node_list+="\n• ${SELECTED_NODES_NAMES[i]} (${SELECTED_NODES_IPS[i]})"
     done
+    confirm "Backup ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\nDestination: $backup_dir" || return
     
-    confirm "Backup the following ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\nBackup destination:\n$backup_dir" || return
-    
-    # Step 5: Process each node
-    local results=""
-    local successful_backups=()
-    local failed_backups=()
-    local total=${#SELECTED_NODES_NAMES[@]}
-    local current=0
+    local successful=() failed=()
+    local total=${#SELECTED_NODES_NAMES[@]} current=0
     local timestamp=$(date +%Y%m%d)
     
-    for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
-        local node_name="${SELECTED_NODES_NAMES[i]}"
-        local node_ip="${SELECTED_NODES_IPS[i]}"
+    for ((i=0; i<total; i++)); do
+        local name="${SELECTED_NODES_NAMES[i]}" ip="${SELECTED_NODES_IPS[i]}"
         ((current++))
         
-        dialog --title "Backing Up Nodes" --infobox "Processing $node_name ($current/$total)...\nTesting SSH connection..." 6 60
+        dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nTesting connection..." 6 60
         
-        # Test SSH connection
-        if ! ssh_exec "$node_ip" "$ssh_user" "$ssh_pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1; then
-            failed_backups+=("$node_name: SSH connection failed")
-            continue
-        fi
+        ssh_exec "$ip" "$user" "$pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1 || \
+            { failed+=("$name: SSH connection failed"); continue; }
         
-        # Generate backup filename
-        local backup_filename="${timestamp}_${node_name}_backup.tar.gz"
-        local remote_backup_path="/tmp/$backup_filename"
+        local backup_file="${timestamp}_${name}_backup.tar.gz"
+        local remote_path="/tmp/$backup_file"
         
-        dialog --title "Backing Up Nodes" --infobox "Processing $node_name ($current/$total)...\nCreating backup archive on remote server..." 7 60
+        dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nCreating archive..." 6 60
         
-        # Create tar.gz archive on remote server (excluding .bloom files)
-        local tar_cmd="cd /root && tar --exclude='*.bloom' -czf $remote_backup_path .nym 2>/dev/null"
-        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "$tar_cmd" "Create Backup Archive" >/dev/null 2>&1; then
-            failed_backups+=("$node_name: Failed to create backup archive")
-            continue
-        fi
+        local tar_cmd="cd /root && tar --exclude='*.bloom' -czf $remote_path .nym 2>/dev/null"
+        ssh_exec "$ip" "$user" "$pass" "$tar_cmd" "Create Archive" "true" >/dev/null 2>&1 || \
+            { failed+=("$name: Failed to create archive"); continue; }
         
-        dialog --title "Backing Up Nodes" --infobox "Processing $node_name ($current/$total)...\nTransferring backup to local machine..." 7 60
+        dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nTransferring..." 6 60
         
-        # Copy backup from remote to local using scp
-        if sshpass -p "$ssh_pass" scp -P "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            "$ssh_user@$node_ip:$remote_backup_path" "$backup_dir/$backup_filename" 2>/dev/null; then
-            
-            # Get file size for confirmation
-            local file_size=$(ls -lh "$backup_dir/$backup_filename" 2>/dev/null | awk '{print $5}')
-            
-            # Cleanup remote backup file
-            ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "rm -f $remote_backup_path" "Cleanup Remote Backup" >/dev/null 2>&1
-            
-            successful_backups+=("$node_name: Backup completed ($file_size) -> $backup_filename")
-            log "BACKUP" "Successfully backed up $node_name to $backup_dir/$backup_filename"
+        if sshpass -p "$pass" scp -P "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "$user@$ip:$remote_path" "$backup_dir/$backup_file" 2>/dev/null; then
+            local size=$(ls -lh "$backup_dir/$backup_file" 2>/dev/null | awk '{print $5}')
+            ssh_exec "$ip" "$user" "$pass" "rm -f $remote_path" "Cleanup" "true" >/dev/null 2>&1
+            successful+=("$name: Backup completed ($size) -> $backup_file")
+            log "BACKUP" "Successfully backed up $name"
         else
-            failed_backups+=("$node_name: Failed to transfer backup file")
-            # Try to cleanup remote file even if transfer failed
-            ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "rm -f $remote_backup_path" "Cleanup Remote Backup" >/dev/null 2>&1
+            failed+=("$name: Failed to transfer backup")
+            ssh_exec "$ip" "$user" "$pass" "rm -f $remote_path" "Cleanup" "true" >/dev/null 2>&1
         fi
     done
     
-    # Step 6: Display results
-    results="💾 Node Backup Results\n────────────────────────────────────────────────────────\n\n"
-    
-    if [[ ${#successful_backups[@]} -gt 0 ]]; then
-        results+="✅ Successfully Backed Up (${#successful_backups[@]} nodes):\n"
-        for backup in "${successful_backups[@]}"; do
-            results+="   • $backup\n"
-        done
-        results+="\n"
-    fi
-    
-    if [[ ${#failed_backups[@]} -gt 0 ]]; then
-        results+="❌ Failed Backups (${#failed_backups[@]} nodes):\n"
-        for failure in "${failed_backups[@]}"; do
-            results+="   • $failure\n"
-        done
-        results+="\n"
-    fi
-    
-    results+="📁 Backup Location: $backup_dir\n"
-    results+="📝 Note: .bloom files excluded from backup"
-    
-    show_success "$results"
+    local info="📂 Backup Location: $backup_dir\n📝 Note: .bloom files excluded"
+    show_operation_results "💾 Node Backup" successful failed "$info"
 }
 
-# 7) Update nym-node
+# Update nym-node binary
 update_nym_node() {
     log "FUNCTION" "update_nym_node"
     
-    # Step 1: Get download URL from user
-    local download_url
-    download_url=$(get_input "Nym-Node Update" "Enter download URL for latest nym-node binary:\n\nExample:\nhttps://github.com/nymtech/nym/releases/download/nym-binaries-v2025.13-emmental/nym-node")
-    [[ -z "$download_url" ]] && { show_msg "Cancelled" "Update cancelled."; return; }
+    local url=$(get_input "Nym-Node Update" "Enter download URL for latest binary:\n\nExample:\nhttps://github.com/nymtech/nym/releases/download/nym-binaries-v2025.13-emmental/nym-node")
+    [[ -z "$url" ]] && { show_msg "Cancelled" "Update cancelled."; return; }
     
-    # Step 2: Select nodes to update
-    if ! select_multiple_nodes; then
-        show_msg "Cancelled" "Node selection cancelled."
-        return
-    fi
+    select_nodes "multi" "Update Nodes" || return
     
-    # Step 3: Get SSH credentials
-    local ssh_user
-    ssh_user=$(get_input "SSH Connection" "Enter SSH username (same for all selected nodes):")
-    [[ -z "$ssh_user" ]] && { show_msg "Cancelled" "Update cancelled."; return; }
+    local user=$(get_input "SSH Connection" "SSH username (same for all):")
+    [[ -z "$user" ]] && { show_msg "Cancelled" "Update cancelled."; return; }
     
-    local ssh_pass
-    ssh_pass=$(get_password "SSH Connection" "Enter SSH password for $ssh_user:")
-    [[ -z "$ssh_pass" ]] && { show_msg "Cancelled" "Update cancelled."; return; }
+    local pass=$(get_password "SSH Connection" "SSH password for $user:")
+    [[ -z "$pass" ]] && { show_msg "Cancelled" "Update cancelled."; return; }
     
-    # Step 4: Confirm update
     local node_list=""
     for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
         node_list+="\n• ${SELECTED_NODES_NAMES[i]} (${SELECTED_NODES_IPS[i]})"
     done
+    confirm "Update nym-node on ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\nURL: $url" || return
     
-    confirm "Update nym-node on the following ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\nDownload URL:\n$download_url" || return
+    local successful=() failed=()
+    local total=${#SELECTED_NODES_NAMES[@]} current=0
     
-    # Step 5: Process each node
-    local results=""
-    local successful_updates=()
-    local failed_updates=()
-    local total=${#SELECTED_NODES_NAMES[@]}
-    local current=0
-    
-    for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
-        local node_name="${SELECTED_NODES_NAMES[i]}"
-        local node_ip="${SELECTED_NODES_IPS[i]}"
+    for ((i=0; i<total; i++)); do
+        local name="${SELECTED_NODES_NAMES[i]}" ip="${SELECTED_NODES_IPS[i]}"
         ((current++))
         
-        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nTesting SSH connection..." 6 60
+        dialog --title "Updating Nym-Node" --infobox "Processing $name ($current/$total)...\nTesting connection..." 6 60
         
-        # Test SSH connection
-        if ! ssh_exec "$node_ip" "$ssh_user" "$ssh_pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1; then
-            failed_updates+=("$node_name: SSH connection failed")
-            continue
-        fi
+        ssh_exec "$ip" "$user" "$pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1 || \
+            { failed+=("$name: SSH connection failed"); continue; }
         
-        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nNavigating to $BINARY_PATH..." 6 60
+        dialog --title "Updating Nym-Node" --infobox "Processing $name ($current/$total)...\nPreparing..." 6 60
         
-        # Create binary directory if it doesn't exist and navigate there
-        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "mkdir -p $BINARY_PATH && cd $BINARY_PATH && pwd" "Create Directory" >/dev/null 2>&1; then
-            failed_updates+=("$node_name: Could not access $BINARY_PATH directory")
-            continue
-        fi
+        # Create directory and backup current binary
+        local prep_cmd="mkdir -p $BINARY_PATH/old && cd $BINARY_PATH && if [ -f nym-node ]; then mv nym-node old/nym-node.backup.\$(date +%Y%m%d_%H%M%S) || true; fi"
+        ssh_exec "$ip" "$user" "$pass" "$prep_cmd" "Prepare Directory" "true" >/dev/null 2>&1 || \
+            { failed+=("$name: Could not prepare directory"); continue; }
         
-        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nBacking up current binary..." 6 60
+        dialog --title "Updating Nym-Node" --infobox "Processing $name ($current/$total)...\nDownloading..." 6 60
         
-        # Create old directory and backup current binary
-        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "cd $BINARY_PATH && mkdir -p old && if [ -f nym-node ]; then mv nym-node old/nym-node.backup.\$(date +%Y%m%d_%H%M%S) || true; fi" "Backup Binary" >/dev/null 2>&1; then
-            failed_updates+=("$node_name: Could not backup current binary")
-            continue
-        fi
+        # Download and make executable
+        local dl_cmd="cd $BINARY_PATH && curl -L -o nym-node '$url' && chmod +x nym-node"
+        ssh_exec "$ip" "$user" "$pass" "$dl_cmd" "Download Binary" "true" >/dev/null 2>&1 || \
+            { failed+=("$name: Could not download binary"); continue; }
         
-        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nDownloading new binary..." 6 60
+        dialog --title "Updating Nym-Node" --infobox "Processing $name ($current/$total)...\nVerifying..." 6 60
         
-        # Download new binary
-        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "cd $BINARY_PATH && curl -L -o nym-node '$download_url' && ls -la nym-node" "Download Binary" >/dev/null 2>&1; then
-            failed_updates+=("$node_name: Could not download new binary")
-            continue
-        fi
+        # Check version
+        local version_output=$(ssh_exec "$ip" "$user" "$pass" "cd $BINARY_PATH && ./nym-node --version" "Check Version" "true" 2>/dev/null)
         
-        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nMaking binary executable..." 6 60
-        
-        # Make binary executable
-        if ! ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "cd $BINARY_PATH && chmod +x nym-node" "Make Executable" >/dev/null 2>&1; then
-            failed_updates+=("$node_name: Could not make binary executable")
-            continue
-        fi
-        
-        dialog --title "Updating Nym-Node" --infobox "Processing $node_name ($current/$total)...\nChecking version..." 6 60
-        
-        # Get version information
-        local version_output
-        version_output=$(ssh_root "$node_ip" "$ssh_user" "$ssh_pass" "cd $BINARY_PATH && ./nym-node --version" "Check Version" 2>/dev/null)
-        
-        if [[ $? -ne 0 || -z "$version_output" ]]; then
-            failed_updates+=("$node_name: Could not check version of new binary")
-            continue
-        fi
-        
-        # Extract version from output
-        local version=""
-        if [[ "$version_output" =~ Build\ Version:[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-            version="${BASH_REMATCH[1]}"
+        if [[ $? -eq 0 && -n "$version_output" ]]; then
+            local version=$(echo "$version_output" | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1)
+            [[ -z "$version" ]] && version="unknown (functional)"
+            successful+=("$name: Updated to version $version")
+            log "UPDATE" "Successfully updated $name to $version"
         else
-            # Fallback: try to extract any version pattern
-            version=$(echo "$version_output" | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1)
+            failed+=("$name: Could not verify new binary")
         fi
-        
-        if [[ -z "$version" ]]; then
-            version="unknown (binary appears functional)"
-        fi
-        
-        successful_updates+=("$node_name: Updated to version $version")
-        log "UPDATE" "Successfully updated $node_name to version $version"
     done
     
-    # Step 6: Display results
-    results="📄 Nym-Node Update Results\n────────────────────────────────────────────────────────\n\n"
-    
-    if [[ ${#successful_updates[@]} -gt 0 ]]; then
-        results+="✅ Successfully Updated (${#successful_updates[@]} nodes):\n"
-        for update in "${successful_updates[@]}"; do
-            results+="   • $update\n"
-        done
-        results+="\n"
-    fi
-    
-    if [[ ${#failed_updates[@]} -gt 0 ]]; then
-        results+="❌ Failed Updates (${#failed_updates[@]} nodes):\n"
-        for failure in "${failed_updates[@]}"; do
-            results+="   • $failure\n"
-        done
-        results+="\n"
-    fi
-    
-    results+="⚠️  IMPORTANT: Restart $SERVICE_NAME on successfully updated nodes\n"
-    results+="   Use menu option 9 to restart services\n\n"
-    results+="💾 Old binaries backed up to $BINARY_PATH/old/ for rollback"
-    
-    show_success "$results"
+    local info="⚠️  IMPORTANT: Restart $SERVICE_NAME on updated nodes\n   Use 'Restart service' in Node Operations menu\n\n💾 Old binaries backed up to $BINARY_PATH/old/"
+    show_operation_results "🔄 Nym-Node Update" successful failed "$info"
 }
 
-# Get current node settings from service file
-get_current_settings() {
-    local ip="$1" user="$2" pass="$3"
-    local service=$(ssh_root "$ip" "$user" "$pass" "cat /etc/systemd/system/$SERVICE_NAME" "Read Service" 2>/dev/null)
-    
-    # Default values
-    CURRENT_WIREGUARD="disabled"
-    CURRENT_MODE="mixnode"
-    
-    if [[ -n "$service" ]]; then
-        # Check Wireguard status
-        if echo "$service" | grep -q -- "--wireguard-enabled true"; then
-            CURRENT_WIREGUARD="enabled"
-        fi
-        
-        # Check mode
-        if echo "$service" | grep -q -- "--mode entry-gateway"; then
-            CURRENT_MODE="entry-gateway"
-        elif echo "$service" | grep -q -- "--mode exit-gateway"; then
-            CURRENT_MODE="exit-gateway"
-        elif echo "$service" | grep -q -- "--mode mixnode"; then
-            CURRENT_MODE="mixnode"
-        fi
-    fi
-}
-
-# 8) Toggle node functionality (Multi-selection with "Select All") - Enhanced with config.toml support
+# Toggle node functionality (Wireguard & Mode)
 toggle_node_functionality() {
     log "FUNCTION" "toggle_node_functionality"
     
-    # Step 1: Select nodes
-    if ! select_multiple_nodes; then
-        show_msg "Cancelled" "Node selection cancelled."
-        return
-    fi
+    select_nodes "multi" "Configure Nodes" || return
     
-    # Step 2: Get SSH credentials (same for all nodes)
-    local user=$(get_input "SSH Connection" "SSH username (same for all selected nodes):")
-    [[ -z "$user" ]] && return
+    local user=$(get_input "SSH Connection" "SSH username (same for all):")
+    [[ -z "$user" ]] && { show_msg "Cancelled" "Configuration cancelled."; return; }
+    
     local pass=$(get_password "SSH Connection" "SSH password for $user:")
-    [[ -z "$pass" ]] && return
+    [[ -z "$pass" ]] && { show_msg "Cancelled" "Configuration cancelled."; return; }
     
-    # Step 3: Test connection to first node
     dialog --title "Configuration" --infobox "Testing SSH connection..." 5 50
-    if ! ssh_exec "${SELECTED_NODES_IPS[0]}" "$user" "$pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1; then
-        show_error "SSH connection failed to ${SELECTED_NODES_NAMES[0]}. Please check credentials."
-        return
-    fi
+    ssh_exec "${SELECTED_NODES_IPS[0]}" "$user" "$pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1 || \
+        { show_error "SSH connection failed. Check credentials."; return; }
     
-    # Step 4: Get configuration preferences
-    # Wireguard setting
+    # Get Wireguard setting
     local wg_choice=$(dialog --title "Wireguard Configuration" --radiolist \
-        "Select Wireguard setting for all selected nodes:" 12 60 2 \
+        "Select Wireguard setting:" 12 60 2 \
         "enabled" "Enable Wireguard" "OFF" \
         "disabled" "Disable Wireguard" "ON" \
         3>&1 1>&2 2>&3)
     [[ $? -ne 0 ]] && return
     
-    # Mixnet mode setting
+    # Get Mode setting
     local mode_choice=$(dialog --title "Mixnet Mode Configuration" --radiolist \
-        "Select mode for all selected nodes:" 14 60 3 \
+        "Select mode:" 14 60 3 \
         "entry-gateway" "Entry Gateway" "OFF" \
         "exit-gateway" "Exit Gateway" "OFF" \
         "mixnode" "Mixnode" "ON" \
         3>&1 1>&2 2>&3)
     [[ $? -ne 0 ]] && return
     
-    # Step 5: Show confirmation
     local node_list=""
     for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
         node_list+="\n• ${SELECTED_NODES_NAMES[i]} (${SELECTED_NODES_IPS[i]})"
     done
+    confirm "Apply configuration to ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\n• Wireguard: $wg_choice\n• Mode: $mode_choice" || return
     
-    confirm "Apply the following configuration to ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\n• Wireguard: $wg_choice\n• Mixnet Mode: $mode_choice" || return
+    local successful=() failed=()
+    local total=${#SELECTED_NODES_NAMES[@]} current=0
     
-    # Step 6: Process each node
-    local results=""
-    local successful_updates=()
-    local failed_updates=()
-    local total=${#SELECTED_NODES_NAMES[@]}
-    local current=0
-    
-    for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
-        local node_name="${SELECTED_NODES_NAMES[i]}"
-        local node_ip="${SELECTED_NODES_IPS[i]}"
-        local node_id="${SELECTED_NODES_IDS[i]}"
+    for ((i=0; i<total; i++)); do
+        local name="${SELECTED_NODES_NAMES[i]}" ip="${SELECTED_NODES_IPS[i]}" node_id="${SELECTED_NODES_IDS[i]}"
         ((current++))
         
-        dialog --title "Configuring Nodes" --infobox "Processing $node_name ($current/$total)...\nUpdating configuration..." 6 60
+        dialog --title "Configuring Nodes" --infobox "Processing $name ($current/$total)..." 6 60
         
-        # Test SSH connection for each node
-        if ! ssh_exec "$node_ip" "$user" "$pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1; then
-            failed_updates+=("$node_name: SSH connection failed")
-            continue
-        fi
+        ssh_exec "$ip" "$user" "$pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1 || \
+            { failed+=("$name: SSH connection failed"); continue; }
         
-        # Get the User from service file
-        local service_user=$(ssh_root "$node_ip" "$user" "$pass" "grep '^User=' /etc/systemd/system/$SERVICE_NAME | cut -d'=' -f2" "Get Service User" 2>/dev/null)
+        # Get service user
+        local service_user=$(ssh_exec "$ip" "$user" "$pass" "grep '^User=' /etc/systemd/system/$SERVICE_NAME | cut -d'=' -f2" "Get User" "true" 2>/dev/null)
+        [[ -z "$service_user" ]] && service_user="root"
         
-        if [[ -z "$service_user" ]]; then
-            service_user="root"  # Default to root if not found
-        fi
+        # Build config path
+        local config_path="/root/.nym/nym-nodes/$node_id/config/config.toml"
+        [[ "$service_user" != "root" ]] && config_path="/home/$service_user/.nym/nym-nodes/$node_id/config/config.toml"
         
-        # Build path to config.toml
-        local config_path
-        if [[ "$service_user" == "root" ]]; then
-            config_path="/root/.nym/nym-nodes/$node_id/config/config.toml"
-        else
-            config_path="/home/$service_user/.nym/nym-nodes/$node_id/config/config.toml"
-        fi
+        local service_updated=false config_updated=false
         
-        # Check if config.toml exists
-        local config_exists=$(ssh_root "$node_ip" "$user" "$pass" "test -f $config_path && echo 'exists'" "Check Config" 2>/dev/null)
-        
-        local service_updated=false
-        local config_updated=false
-        
-        # Try to update service file first (for backward compatibility)
-        local wg_flag=$([ "$wg_choice" = "enabled" ] && echo "true" || echo "false")
-        local sed_commands=""
-        
-        # Check if service file has flags
-        local has_flags=$(ssh_root "$node_ip" "$user" "$pass" "grep -E '(--wireguard-enabled|--mode)' /etc/systemd/system/$SERVICE_NAME" "Check Flags" 2>/dev/null)
+        # Check for service file flags
+        local has_flags=$(ssh_exec "$ip" "$user" "$pass" "grep -E '(--wireguard-enabled|--mode)' /etc/systemd/system/$SERVICE_NAME" "Check Flags" "true" 2>/dev/null)
         
         if [[ -n "$has_flags" ]]; then
-            # Update service file if it has flags
-            sed_commands+="sed -i 's/--wireguard-enabled [^ ]*/--wireguard-enabled $wg_flag/g; t wireguard_updated; s/\\(ExecStart=[^ ]* run\\)/\\1 --wireguard-enabled $wg_flag/; :wireguard_updated' /etc/systemd/system/$SERVICE_NAME && "
-            sed_commands+="sed -i 's/--mode [^ ]*/--mode $mode_choice/g; t mode_updated; s/\\(ExecStart=[^ ]* run\\)/\\1 --mode $mode_choice/; :mode_updated' /etc/systemd/system/$SERVICE_NAME && "
+            local wg_flag=$([ "$wg_choice" = "enabled" ] && echo "true" || echo "false")
+            local update_cmd="cp /etc/systemd/system/$SERVICE_NAME /etc/systemd/system/$SERVICE_NAME.backup.\$(date +%Y%m%d_%H%M%S) && "
+            update_cmd+="sed -i 's/--wireguard-enabled [^ ]*/--wireguard-enabled $wg_flag/g; t wg; s/\\(ExecStart=[^ ]* run\\)/\\1 --wireguard-enabled $wg_flag/; :wg' /etc/systemd/system/$SERVICE_NAME && "
+            update_cmd+="sed -i 's/--mode [^ ]*/--mode $mode_choice/g; t mode; s/\\(ExecStart=[^ ]* run\\)/\\1 --mode $mode_choice/; :mode' /etc/systemd/system/$SERVICE_NAME && "
+            update_cmd+="systemctl daemon-reload"
             
-            local update_cmd="cp /etc/systemd/system/$SERVICE_NAME /etc/systemd/system/$SERVICE_NAME.backup.\$(date +%Y%m%d_%H%M%S) && ${sed_commands}systemctl daemon-reload"
-            
-            if ssh_root "$node_ip" "$user" "$pass" "$update_cmd" "Update Service File" >/dev/null 2>&1; then
-                service_updated=true
-            fi
+            ssh_exec "$ip" "$user" "$pass" "$update_cmd" "Update Service" "true" >/dev/null 2>&1 && service_updated=true
         fi
         
-        # Update config.toml if it exists
+        # Update config.toml if exists
+        local config_exists=$(ssh_exec "$ip" "$user" "$pass" "test -f $config_path && echo 'exists'" "Check Config" "true" 2>/dev/null)
+        
         if [[ "$config_exists" == "exists" ]]; then
-            # Determine mode booleans based on choice
-            local mixnode_val="false"
-            local entry_val="false"
-            local exit_val="false"
-            
+            local mixnode_val="false" entry_val="false" exit_val="false"
             case "$mode_choice" in
                 "mixnode") mixnode_val="true" ;;
                 "entry-gateway") entry_val="true" ;;
                 "exit-gateway") exit_val="true" ;;
             esac
             
-            local wg_toml_val=$([ "$wg_choice" = "enabled" ] && echo "true" || echo "false")
+            local wg_toml=$([ "$wg_choice" = "enabled" ] && echo "true" || echo "false")
+            local config_cmd="cp $config_path ${config_path}.backup.\$(date +%Y%m%d_%H%M%S) && "
+            config_cmd+="sed -i '/^\[modes\]/,/^\[/ { s/^mixnode = .*/mixnode = $mixnode_val/; s/^entry = .*/entry = $entry_val/; s/^exit = .*/exit = $exit_val/; }' $config_path && "
+            config_cmd+="sed -i '/^\[wireguard\]/,/^\[/ { s/^enabled = .*/enabled = $wg_toml/; }' $config_path"
             
-            # Update config.toml
-            local config_update_cmd="cp $config_path ${config_path}.backup.\$(date +%Y%m%d_%H%M%S) && "
-            config_update_cmd+="sed -i '/^\[modes\]/,/^\[/ { s/^mixnode = .*/mixnode = $mixnode_val/; s/^entry = .*/entry = $entry_val/; s/^exit = .*/exit = $exit_val/; }' $config_path && "
-            config_update_cmd+="sed -i '/^\[wireguard\]/,/^\[/ { s/^enabled = .*/enabled = $wg_toml_val/; }' $config_path"
-            
-            if ssh_root "$node_ip" "$user" "$pass" "$config_update_cmd" "Update Config TOML" >/dev/null 2>&1; then
-                config_updated=true
-            fi
+            ssh_exec "$ip" "$user" "$pass" "$config_cmd" "Update Config" "true" >/dev/null 2>&1 && config_updated=true
         fi
         
-        # Determine success
         if [[ "$service_updated" == "true" || "$config_updated" == "true" ]]; then
-            local update_method=""
-            if [[ "$service_updated" == "true" && "$config_updated" == "true" ]]; then
-                update_method="service file and config.toml"
-            elif [[ "$service_updated" == "true" ]]; then
-                update_method="service file"
-            else
-                update_method="config.toml"
-            fi
-            successful_updates+=("$node_name: Updated ($update_method)")
-            log "CONFIG" "Successfully updated $node_name configuration via $update_method"
+            local method=""
+            [[ "$service_updated" == "true" && "$config_updated" == "true" ]] && method="service & config.toml"
+            [[ "$service_updated" == "true" && "$config_updated" == "false" ]] && method="service file"
+            [[ "$service_updated" == "false" && "$config_updated" == "true" ]] && method="config.toml"
+            successful+=("$name: Updated ($method)")
+            log "CONFIG" "Updated $name via $method"
         else
-            failed_updates+=("$node_name: Failed to update configuration")
+            failed+=("$name: Failed to update configuration")
         fi
     done
     
-    # Step 7: Display results
-    results="🔧 Node Configuration Results\n────────────────────────────────────────────────────────\n\n"
-    
-    if [[ ${#successful_updates[@]} -gt 0 ]]; then
-        results+="✅ Successfully Updated (${#successful_updates[@]} nodes):\n"
-        for update in "${successful_updates[@]}"; do
-            results+="   • $update\n"
-        done
-        results+="\n"
-    fi
-    
-    if [[ ${#failed_updates[@]} -gt 0 ]]; then
-        results+="❌ Failed Updates (${#failed_updates[@]} nodes):\n"
-        for failure in "${failed_updates[@]}"; do
-            results+="   • $failure\n"
-        done
-        results+="\n"
-    fi
-    
-    results+="Applied Configuration:\n"
-    results+="   • Wireguard: $wg_choice\n"
-    results+="   • Mixnet Mode: $mode_choice\n\n"
-    results+="⚠️  IMPORTANT: Restart services on successfully updated nodes\n"
-    results+="   Use menu option 9 to restart services"
-    
-    show_success "$results"
+    local info="Applied Configuration:\n   • Wireguard: $wg_choice\n   • Mode: $mode_choice\n\n⚠️  IMPORTANT: Restart services on updated nodes"
+    show_operation_results "🔧 Node Configuration" successful failed "$info"
 }
 
-# 9) Restart service (Multi-selection with "Select All")
+# Restart service on nodes
 restart_service() {
     log "FUNCTION" "restart_service"
     
-    # Step 1: Select nodes
-    if ! select_multiple_nodes; then
-        show_msg "Cancelled" "Node selection cancelled."
-        return
-    fi
+    select_nodes "multi" "Restart Service" || return
     
-    # Step 2: Get SSH credentials (same for all nodes)
-    local user=$(get_input "SSH Connection" "SSH username (same for all selected nodes):")
-    [[ -z "$user" ]] && return
+    local user=$(get_input "SSH Connection" "SSH username (same for all):")
+    [[ -z "$user" ]] && { show_msg "Cancelled" "Restart cancelled."; return; }
+    
     local pass=$(get_password "SSH Connection" "SSH password for $user:")
-    [[ -z "$pass" ]] && return
+    [[ -z "$pass" ]] && { show_msg "Cancelled" "Restart cancelled."; return; }
     
-    # Step 3: Show confirmation
     local node_list=""
     for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
         node_list+="\n• ${SELECTED_NODES_NAMES[i]} (${SELECTED_NODES_IPS[i]})"
     done
+    confirm "Restart $SERVICE_NAME on ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list" || return
     
-    confirm "Restart $SERVICE_NAME on the following ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list" || return
+    local successful=() failed=()
+    local total=${#SELECTED_NODES_NAMES[@]} current=0
     
-    # Step 4: Process each node
-    local results=""
-    local successful_restarts=()
-    local failed_restarts=()
-    local total=${#SELECTED_NODES_NAMES[@]}
-    local current=0
-    
-    for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
-        local node_name="${SELECTED_NODES_NAMES[i]}"
-        local node_ip="${SELECTED_NODES_IPS[i]}"
+    for ((i=0; i<total; i++)); do
+        local name="${SELECTED_NODES_NAMES[i]}" ip="${SELECTED_NODES_IPS[i]}"
         ((current++))
         
-        dialog --title "Restarting Services" --infobox "Processing $node_name ($current/$total)...\nRestarting $SERVICE_NAME..." 6 60
+        dialog --title "Restarting Services" --infobox "Processing $name ($current/$total)..." 6 60
         
-        # Test SSH connection
-        if ! ssh_exec "$node_ip" "$user" "$pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1; then
-            failed_restarts+=("$node_name: SSH connection failed")
-            continue
-        fi
+        ssh_exec "$ip" "$user" "$pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1 || \
+            { failed+=("$name: SSH connection failed"); continue; }
         
-        # Restart service
-        if ssh_exec "$node_ip" "$user" "$pass" "echo '$pass' | sudo -S systemctl restart $SERVICE_NAME" "Restart Service" >/dev/null 2>&1; then
-            # Wait a moment and check status
+        if ssh_exec "$ip" "$user" "$pass" "echo '$pass' | sudo -S systemctl restart $SERVICE_NAME" "Restart" >/dev/null 2>&1; then
             sleep 2
-            local status=$(ssh_exec "$node_ip" "$user" "$pass" "sudo systemctl is-active $SERVICE_NAME" "Check Status" 2>/dev/null)
-            if [[ -n "$status" ]]; then
-                successful_restarts+=("$node_name: Service restarted (Status: $status)")
-                log "RESTART" "Successfully restarted $node_name service"
-            else
-                successful_restarts+=("$node_name: Service restarted (Status check failed)")
-            fi
+            local status=$(ssh_exec "$ip" "$user" "$pass" "sudo systemctl is-active $SERVICE_NAME" "Status Check" 2>/dev/null)
+            [[ -n "$status" ]] && successful+=("$name: Restarted (Status: $status)") || successful+=("$name: Restarted")
+            log "RESTART" "Successfully restarted $name"
         else
-            failed_restarts+=("$node_name: Failed to restart service")
+            failed+=("$name: Failed to restart service")
         fi
     done
     
-    # Step 5: Display results
-    results="🔄 Service Restart Results\n────────────────────────────────────────────────────────\n\n"
-    
-    if [[ ${#successful_restarts[@]} -gt 0 ]]; then
-        results+="✅ Successfully Restarted (${#successful_restarts[@]} nodes):\n"
-        for restart in "${successful_restarts[@]}"; do
-            results+="   • $restart\n"
-        done
-        results+="\n"
-    fi
-    
-    if [[ ${#failed_restarts[@]} -gt 0 ]]; then
-        results+="❌ Failed Restarts (${#failed_restarts[@]} nodes):\n"
-        for failure in "${failed_restarts[@]}"; do
-            results+="   • $failure\n"
-        done
-        results+="\n"
-    fi
-    
-    results+="🎯 Service Restart Complete!"
-    
-    show_success "$results"
+    show_operation_results "🔄 Service Restart" successful failed "🎯 Service Restart Complete!"
 }
 
-# 10) Configuration menu
+# ----------------------------------------------------------------------------
+# CONFIGURATION MENU FUNCTIONS
+# ----------------------------------------------------------------------------
+
+# Configuration submenu
 config_menu() {
     log "FUNCTION" "config_menu"
     
     while true; do
-        local current_config="Current Configuration:\n"
-        current_config+="• SSH Port: $SSH_PORT\n"
-        current_config+="• Service Name: $SERVICE_NAME\n"
-        current_config+="• Binary Path: $BINARY_PATH"
+        local info="Current Configuration:\n• SSH Port: $SSH_PORT\n• Service Name: $SERVICE_NAME\n• Binary Path: $BINARY_PATH"
         
         local choice=$(dialog --clear --title "Configuration Menu" \
-            --menu "$current_config\n\nSelect configuration option:" 18 70 5 \
+            --menu "$info\n\nSelect option:" 18 70 5 \
             1 "Custom SSH Port (Current: $SSH_PORT)" \
             2 "Systemd Service Name (Current: $SERVICE_NAME)" \
             3 "Custom Binary Folder (Current: $BINARY_PATH)" \
@@ -1188,7 +924,6 @@ config_menu() {
             3) config_binary_path ;;
             4) config_reset_defaults ;;
             0) break ;;
-            *) show_error "Invalid option." ;;
         esac
     done
 }
@@ -1198,14 +933,13 @@ config_ssh_port() {
     local new_port=$(get_input "SSH Port Configuration" "Enter SSH port (current: $SSH_PORT):")
     [[ -z "$new_port" ]] && return
     
-    # Validate port number
     if [[ "$new_port" =~ ^[0-9]+$ ]] && [[ "$new_port" -ge 1 ]] && [[ "$new_port" -le 65535 ]]; then
         SSH_PORT="$new_port"
         save_config
         show_success "SSH port updated to $SSH_PORT"
         log "CONFIG" "SSH port changed to $SSH_PORT"
     else
-        show_error "Invalid port number. Please enter a number between 1 and 65535."
+        show_error "Invalid port. Enter a number between 1 and 65535."
     fi
 }
 
@@ -1214,10 +948,7 @@ config_service_name() {
     local new_service=$(get_input "Service Name Configuration" "Enter systemd service name (current: $SERVICE_NAME):")
     [[ -z "$new_service" ]] && return
     
-    # Add .service extension if not present
-    if [[ "$new_service" != *.service ]]; then
-        new_service="$new_service.service"
-    fi
+    [[ "$new_service" != *.service ]] && new_service="$new_service.service"
     
     SERVICE_NAME="$new_service"
     save_config
@@ -1230,7 +961,6 @@ config_binary_path() {
     local new_path=$(get_input "Binary Path Configuration" "Enter binary folder path (current: $BINARY_PATH):")
     [[ -z "$new_path" ]] && return
     
-    # Remove trailing slash if present
     new_path=$(echo "$new_path" | sed 's|/$||')
     
     BINARY_PATH="$new_path"
@@ -1239,9 +969,9 @@ config_binary_path() {
     log "CONFIG" "Binary path changed to $BINARY_PATH"
 }
 
-# Reset to defaults
+# Reset configuration to defaults
 config_reset_defaults() {
-    confirm "Reset all configuration to defaults?\n\nSSH Port: $DEFAULT_SSH_PORT\nService Name: $DEFAULT_SERVICE_NAME\nBinary Path: $DEFAULT_BINARY_PATH" || return
+    confirm "Reset all configuration to defaults?\n\nSSH Port: $DEFAULT_SSH_PORT\nService: $DEFAULT_SERVICE_NAME\nBinary: $DEFAULT_BINARY_PATH" || return
     
     SSH_PORT="$DEFAULT_SSH_PORT"
     SERVICE_NAME="$DEFAULT_SERVICE_NAME"
@@ -1251,17 +981,26 @@ config_reset_defaults() {
     log "CONFIG" "Configuration reset to defaults"
 }
 
-# 11) Test SSH
+# ----------------------------------------------------------------------------
+# DIAGNOSTICS MENU FUNCTIONS
+# ----------------------------------------------------------------------------
+
+# Test SSH connection and capabilities
 test_ssh() {
     log "FUNCTION" "test_ssh"
-    select_node || return
     
-    local user=$(get_input "SSH Test" "SSH username for $SELECTED_NODE_NAME:")
+    select_nodes "single" "Test SSH" || return
+    
+    local name="${SELECTED_NODES_NAMES[0]}" ip="${SELECTED_NODES_IPS[0]}"
+    
+    local user=$(get_input "SSH Test" "SSH username for $name:")
     [[ -z "$user" ]] && return
-    local pass=$(get_password "SSH Test" "SSH password for $user@$SELECTED_NODE_IP:")
+    
+    local pass=$(get_password "SSH Test" "SSH password for $user@$ip:")
     [[ -z "$pass" ]] && return
     
-    local results="🔧 SSH Test Results for $SELECTED_NODE_NAME ($SELECTED_NODE_IP:$SSH_PORT)\n────────────────────────────────────────────────────────\n\n"
+    local results="🔧 SSH Test Results: $name ($ip:$SSH_PORT)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
     local tests=(
         "Basic Connection:echo 'OK'"
         "Working Directory:pwd"
@@ -1269,7 +1008,7 @@ test_ssh() {
         "Sudo Access:echo '$pass' | sudo -S whoami"
         "Root Switch:echo '$pass' | sudo -S su -c 'whoami'"
         "Service File:echo '$pass' | sudo -S test -f /etc/systemd/system/$SERVICE_NAME && echo 'EXISTS'"
-        "Systemctl:echo '$pass' | sudo -S systemctl is-active $SERVICE_NAME"
+        "Service Status:echo '$pass' | sudo -S systemctl is-active $SERVICE_NAME"
     )
     
     local step=1
@@ -1277,7 +1016,7 @@ test_ssh() {
         local desc="${test%%:*}" cmd="${test#*:}"
         dialog --title "SSH Test" --infobox "Step $step/7: Testing $desc..." 5 50
         
-        if output=$(ssh_exec "$SELECTED_NODE_IP" "$user" "$pass" "$cmd" "$desc" 2>/dev/null); then
+        if output=$(ssh_exec "$ip" "$user" "$pass" "$cmd" "$desc" 2>/dev/null); then
             results+="✅ Step $step: $desc - SUCCESS\n   Result: $output\n"
         else
             results+="❌ Step $step: $desc - FAILED\n"
@@ -1289,42 +1028,123 @@ test_ssh() {
     show_success "$results"
 }
 
-# 12) Show debug log
+# Show debug log
 show_debug() {
-    [[ -f "$DEBUG_LOG" ]] && dialog --title "Debug Log" --msgbox "$(tail -50 "$DEBUG_LOG")" 25 100 ||
+    log "FUNCTION" "show_debug"
+    
+    [[ -f "$DEBUG_LOG" ]] && dialog --title "Debug Log (Last 50 lines)" --msgbox "$(tail -50 "$DEBUG_LOG")" 25 100 ||
         show_msg "No Log" "Debug log not found."
+}
+
+# ----------------------------------------------------------------------------
+# MENU SYSTEM - Organized submenus
+# ----------------------------------------------------------------------------
+
+# Node Management submenu
+node_management_menu() {
+    while true; do
+        local choice=$(dialog --clear --title "Node Management" \
+            --menu "Manage your Nym nodes:" 15 60 5 \
+            1 "List all nodes" \
+            2 "Add node" \
+            3 "Edit node" \
+            4 "Delete node" \
+            0 "Back to Main Menu" \
+            3>&1 1>&2 2>&3)
+        
+        [[ $? -ne 0 ]] && break
+        
+        case $choice in
+            1) list_nodes ;;
+            2) add_node ;;
+            3) edit_node ;;
+            4) delete_node ;;
+            0) break ;;
+        esac
+    done
+}
+
+# Node Operations submenu
+node_operations_menu() {
+    while true; do
+        local choice=$(dialog --clear --title "Node Operations" \
+            --menu "Perform operations on nodes:" 17 60 6 \
+            1 "Retrieve node roles" \
+            2 "Backup node" \
+            3 "Update nym-node binary" \
+            4 "Toggle functionality (Mixnet & Wireguard)" \
+            5 "Restart service" \
+            0 "Back to Main Menu" \
+            3>&1 1>&2 2>&3)
+        
+        [[ $? -ne 0 ]] && break
+        
+        case $choice in
+            1) retrieve_node_roles ;;
+            2) backup_node ;;
+            3) update_nym_node ;;
+            4) toggle_node_functionality ;;
+            5) restart_service ;;
+            0) break ;;
+        esac
+    done
+}
+
+# Diagnostics submenu
+diagnostics_menu() {
+    while true; do
+        local choice=$(dialog --clear --title "Diagnostics" \
+            --menu "Diagnostic tools:" 13 60 3 \
+            1 "Test SSH connection" \
+            2 "Show debug log" \
+            0 "Back to Main Menu" \
+            3>&1 1>&2 2>&3)
+        
+        [[ $? -ne 0 ]] && break
+        
+        case $choice in
+            1) test_ssh ;;
+            2) show_debug ;;
+            0) break ;;
+        esac
+    done
 }
 
 # Main menu
 main_menu() {
     while true; do
         local choice=$(dialog --clear --title "$SCRIPT_NAME v$VERSION" \
-            --menu "Select an option:" 22 70 14 \
-            1 "List all nodes" 2 "Add node" 3 "Edit node" 4 "Delete node" \
-            5 "Retrieve node roles" 6 "Backup node" 7 "Update nym-node" \
-            8 "Toggle node functionality (Mixnet & Wireguard)" \
-            9 "Restart service" 10 "Config" 11 "Test SSH" 12 "Show debug log" 0 "Exit" \
+            --menu "Select category:" 16 60 5 \
+            1 "Node Management" \
+            2 "Node Operations" \
+            3 "Configuration" \
+            4 "Diagnostics" \
+            0 "Exit" \
             3>&1 1>&2 2>&3)
         
         [[ $? -ne 0 ]] && break
         
         case $choice in
-            1) list_nodes ;; 2) add_node ;; 3) edit_node ;; 4) delete_node ;;
-            5) retrieve_node_roles ;; 6) backup_node ;; 7) update_nym_node ;; 
-            8) toggle_node_functionality ;; 9) restart_service ;;
-            10) config_menu ;; 11) test_ssh ;; 12) show_debug ;;
+            1) node_management_menu ;;
+            2) node_operations_menu ;;
+            3) config_menu ;;
+            4) diagnostics_menu ;;
             0) confirm "Exit?" && break ;;
-            *) show_error "Invalid option." ;;
         esac
     done
 }
 
-# Main execution
+# ----------------------------------------------------------------------------
+# MAIN EXECUTION
+# ----------------------------------------------------------------------------
+
 main() {
-    init_debug; log "MAIN" "Application starting"
-    load_config  # Load configuration on startup
+    init_debug
+    log "MAIN" "Application starting - Version $VERSION"
+    load_config
     trap 'clear; echo -e "${GREEN}Thank you for using $SCRIPT_NAME!${NC}"; exit 0' EXIT INT TERM
-    check_deps; main_menu
+    check_deps
+    main_menu
 }
 
 main "$@"
