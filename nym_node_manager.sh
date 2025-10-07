@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # ============================================================================
-# Nym Node Manager v51 - Optimized & Refactored
+# Nym Node Manager v56 - Optimized & Refactored
 # ============================================================================
 # Description: Centralized management tool for Nym network nodes
-# Requirements: dialog, sshpass, curl
+# Requirements: dialog, expect, curl, rsync
 # Features: Multi-node operations, backup, updates, configuration management
 # ============================================================================
 
@@ -13,7 +13,7 @@
 # ----------------------------------------------------------------------------
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 SCRIPT_NAME="Nym Node Manager"
-VERSION="51"
+VERSION="56"
 SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
 DEBUG_LOG="$SCRIPT_DIR/debug.log"
 NODES_FILE="$SCRIPT_DIR/nodes.txt"
@@ -105,7 +105,7 @@ EOF
 # Check and install missing dependencies
 check_deps() {
     local missing=()
-    for cmd in dialog sshpass curl; do
+    for cmd in dialog expect curl rsync; do
         command -v "$cmd" >/dev/null || missing+=("$cmd")
     done
     
@@ -114,6 +114,9 @@ check_deps() {
         if command -v apt-get >/dev/null; then
             echo "Installing with apt-get..."
             sudo apt-get update && sudo apt-get install -y "${missing[@]}" || exit 1
+        elif command -v brew >/dev/null; then
+            echo "Installing with Homebrew..."
+            brew install "${missing[@]}" || exit 1
         else
             echo -e "${RED}Install manually: ${missing[*]}${NC}"; exit 1
         fi
@@ -267,18 +270,46 @@ remove_nodes_from_file() {
 ssh_exec() {
     local ip="$1" user="$2" pass="$3" cmd="$4" desc="${5:-SSH Command}" use_root="${6:-false}"
     
-    # Build command with root elevation if requested
     if [[ "$use_root" == "true" ]]; then
         cmd="echo '$pass' | sudo -S su -c \"$cmd\""
     fi
     
-    # Sanitize for logging
-    local safe_cmd=$(echo "$cmd" | sed "s/${pass//\//\\/}/***REDACTED***/g")
-    log "SSH" "$desc: $user@$ip:$SSH_PORT - $safe_cmd"
+    log "SSH" "$desc: $user@$ip:$SSH_PORT [secure - no password in log]"
     
-    local output=$(sshpass -p "$pass" ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o ConnectTimeout=10 -o BatchMode=no "$user@$ip" "$cmd" 2>&1)
+    local expect_script=$(mktemp)
+    cat > "$expect_script" << 'EXPECTSCRIPT'
+#!/usr/bin/expect -f
+set timeout 30
+set ip [lindex $argv 0]
+set user [lindex $argv 1]
+set password [lindex $argv 2]
+set port [lindex $argv 3]
+set command [lindex $argv 4]
+log_user 0
+spawn ssh -p $port -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 $user@$ip $command
+expect {
+    "password:" {
+        send "$password\r"
+        expect {
+            "Permission denied" { exit 1 }
+            eof
+        }
+    }
+    "Are you sure you want to continue connecting" {
+        send "yes\r"
+        exp_continue
+    }
+    timeout { exit 2 }
+    eof
+}
+catch wait result
+exit [lindex $result 3]
+EXPECTSCRIPT
+    
+    chmod 700 "$expect_script"
+    local output=$("$expect_script" "$ip" "$user" "$pass" "$SSH_PORT" "$cmd" 2>&1)
     local exit_code=$?
+    rm -f "$expect_script"
     
     if [[ $exit_code -eq 0 ]]; then
         echo "$output"
@@ -360,7 +391,7 @@ show_operation_results() {
     local additional="${4:-}"
     
     local results="$operation Results\n"
-    results+="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    results+="────────────────────────────────────────────────────────\n\n"
     
     if [[ ${#success_arr[@]} -gt 0 ]]; then
         results+="✅ Success (${#success_arr[@]} nodes):\n"
@@ -399,7 +430,7 @@ list_nodes() {
         case "$line" in
             "Node Name: "*)
                 [[ -n "$current_node" ]] && content+="\n"
-                content+="🖥️ NODE: ${line#Node Name: }\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                content+="🖥️ NODE: ${line#Node Name: }\n────────────────────────────────────────\n"
                 current_node="yes" ;;
             "IP Address: "*) content+="🌐 IP: ${line#IP Address: }\n" ;;
             "Node ID: "*) content+="🆔 ID: ${line#Node ID: }\n" ;;
@@ -611,18 +642,18 @@ retrieve_node_roles() {
     show_success "Node roles retrieved for $processed nodes!"
 }
 
-# Backup nodes to local directory
+# Backup nodes to /tmp on remote servers and download to local machine
 backup_node() {
     log "FUNCTION" "backup_node"
     
-    local backup_dir=$(get_input "Backup Destination" "Enter local backup directory:\n(Leave empty for: $SCRIPT_DIR)")
-    [[ -z "$backup_dir" ]] && backup_dir="$SCRIPT_DIR"
-    
-    if [[ ! -d "$backup_dir" ]]; then
-        dialog --title "Create Directory" --infobox "Creating: $backup_dir..." 5 60
-        mkdir -p "$backup_dir" 2>/dev/null || { show_error "Cannot create: $backup_dir"; return; }
+    # Check rsync availability on client
+    if ! command -v rsync >/dev/null 2>&1; then
+        show_error "rsync is not installed on this machine.\n\nPlease install it:\n- Debian/Ubuntu: sudo apt-get install rsync\n- macOS: brew install rsync\n- Or run dependency check from main menu"
+        return
     fi
-    backup_dir=$(cd "$backup_dir" && pwd)
+    
+    local client_rsync_version=$(rsync --version 2>/dev/null | head -1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1)
+    log "BACKUP" "Client rsync version: $client_rsync_version"
     
     select_nodes "multi" "Backup Nodes" || return
     
@@ -632,49 +663,261 @@ backup_node() {
     local pass=$(get_password "SSH Connection" "SSH password for $user:")
     [[ -z "$pass" ]] && { show_msg "Cancelled" "Backup cancelled."; return; }
     
+    # Ask for local backup destination
+    local backup_dir=$(get_input "Backup Destination" "Enter local backup directory:\n(Leave empty for: $SCRIPT_DIR)")
+    [[ -z "$backup_dir" ]] && backup_dir="$SCRIPT_DIR"
+    
+    if [[ ! -d "$backup_dir" ]]; then
+        dialog --title "Create Directory" --infobox "Creating: $backup_dir..." 5 60
+        mkdir -p "$backup_dir" 2>/dev/null || { show_error "Cannot create: $backup_dir"; return; }
+    fi
+    backup_dir=$(cd "$backup_dir" && pwd)
+    
     local node_list=""
     for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
         node_list+="\n• ${SELECTED_NODES_NAMES[i]} (${SELECTED_NODES_IPS[i]})"
     done
-    confirm "Backup ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\nDestination: $backup_dir" || return
+    confirm "Backup ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\nLocal destination: $backup_dir" || return
     
     local successful=() failed=()
     local total=${#SELECTED_NODES_NAMES[@]} current=0
-    local timestamp=$(date +%Y%m%d)
+    local timestamp=$(date +%Y%m%d_%H%M%S)
     
     for ((i=0; i<total; i++)); do
-        local name="${SELECTED_NODES_NAMES[i]}" ip="${SELECTED_NODES_IPS[i]}"
+        local name="${SELECTED_NODES_NAMES[i]}" ip="${SELECTED_NODES_IPS[i]}" node_id="${SELECTED_NODES_IDS[i]}"
         ((current++))
         
         dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nTesting connection..." 6 60
+        log "BACKUP" "Starting backup for $name ($ip)"
         
-        ssh_exec "$ip" "$user" "$pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1 || \
-            { failed+=("$name: SSH connection failed"); continue; }
+        # Test SSH connection
+        if ! ssh_exec "$ip" "$user" "$pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1; then
+            failed+=("$name: SSH connection failed")
+            log "BACKUP" "FAILED - SSH connection failed for $name"
+            continue
+        fi
         
-        local backup_file="${timestamp}_${name}_backup.tar.gz"
-        local remote_path="/tmp/$backup_file"
+        # Check rsync on remote server
+        dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nChecking rsync..." 6 60
+        local remote_rsync_check=$(ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 "$user@$ip" "command -v rsync >/dev/null && rsync --version 2>/dev/null | head -1" 2>&1)
+        
+        if [[ -z "$remote_rsync_check" ]]; then
+            log "BACKUP" "$name: rsync not found, attempting to install"
+            dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nInstalling rsync..." 6 60
+            
+            local install_output=$(ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR "$user@$ip" "echo '$pass' | sudo -S apt-get update >/dev/null 2>&1 && echo '$pass' | sudo -S apt-get install -y rsync 2>&1" 2>&1)
+            
+            remote_rsync_check=$(ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR "$user@$ip" "rsync --version 2>/dev/null | head -1" 2>&1)
+            
+            if [[ -z "$remote_rsync_check" ]]; then
+                failed+=("$name: Could not install rsync on remote server")
+                log "BACKUP" "FAILED - $name: rsync installation failed"
+                continue
+            fi
+            log "BACKUP" "$name: rsync installed successfully"
+        fi
+        
+        local remote_rsync_version=$(echo "$remote_rsync_check" | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1)
+        log "BACKUP" "$name: Remote rsync version: $remote_rsync_version"
+        
+        dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nDetermining service user..." 6 60
+        
+        # Get the user that runs the service (using sudo to ensure we can read the file)
+        local check_user_cmd="if [ -f /etc/systemd/system/$SERVICE_NAME ]; then grep '^User=' /etc/systemd/system/$SERVICE_NAME | cut -d'=' -f2 | head -1; else echo 'NOFILE'; fi"
+        local service_user_raw=$(ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 "$user@$ip" "echo '$pass' | sudo -S bash -c '$check_user_cmd'" 2>&1)
+        # Extract result: remove sudo prompts and warnings, get last word on line
+        local service_user=$(echo "$service_user_raw" | sed 's/\[sudo\] password for [^:]*: //g' | grep -v "^Warning:" | grep -v "^Permanently" | grep -v "^Sorry" | tail -1 | tr -d '[:space:]')
+        
+        log "BACKUP" "$name: Raw service user output: '$service_user_raw'"
+        log "BACKUP" "$name: Cleaned service user: '$service_user'"
+        
+        if [[ -z "$service_user" || "$service_user" == "NOFILE" ]]; then
+            service_user="root"
+            log "BACKUP" "$name: No User= line found in service file or file doesn't exist, assuming root"
+        else
+            log "BACKUP" "$name: Service runs as user '$service_user'"
+        fi
+        
+        # Determine .nym folder location
+        local nym_path
+        if [[ "$service_user" == "root" ]]; then
+            nym_path="/root/.nym"
+        else
+            nym_path="/home/$service_user/.nym"
+        fi
+        
+        log "BACKUP" "$name: .nym path determined as $nym_path"
+        
+        dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nChecking folder access..." 6 60
+        
+        # Check if folder exists using sudo (we always need root access for backups)
+        local folder_check_raw=$(ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 "$user@$ip" "echo '$pass' | sudo -S test -d $nym_path && echo 'EXISTS' || echo 'NOTFOUND'" 2>&1)
+        local folder_check=$(echo "$folder_check_raw" | sed 's/\[sudo\] password for [^:]*: //g' | grep -v "^Warning:" | grep -v "^Permanently" | tail -1 | tr -d '[:space:]')
+        
+        log "BACKUP" "$name: Raw folder check output: '$folder_check_raw'"
+        log "BACKUP" "$name: Cleaned folder check: '$folder_check'"
+        
+        if [[ "$folder_check" != "EXISTS" ]]; then
+            failed+=("$name: .nym folder not found at $nym_path")
+            log "BACKUP" "FAILED - $name: Folder $nym_path does not exist"
+            continue
+        fi
+        
+        log "BACKUP" "$name: Folder exists at $nym_path"
         
         dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nCreating archive..." 6 60
         
-        local tar_cmd="cd /root && tar --exclude='*.bloom' -czf $remote_path .nym 2>/dev/null"
-        ssh_exec "$ip" "$user" "$pass" "$tar_cmd" "Create Archive" "true" >/dev/null 2>&1 || \
-            { failed+=("$name: Failed to create archive"); continue; }
+        local backup_file="nym_backup_${name}_${timestamp}.tar.gz"
+        local backup_path="/tmp/$backup_file"
         
-        dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nTransferring..." 6 60
+        # Create tar archive excluding .corrupted and .bloom files, using sudo
+        # We need to be careful with quoting when nesting commands
+        local parent_dir=$(dirname "$nym_path")
+        local dir_name=$(basename "$nym_path")
         
-        if sshpass -p "$pass" scp -P "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            "$user@$ip:$remote_path" "$backup_dir/$backup_file" 2>/dev/null; then
-            local size=$(ls -lh "$backup_dir/$backup_file" 2>/dev/null | awk '{print $5}')
-            ssh_exec "$ip" "$user" "$pass" "rm -f $remote_path" "Cleanup" "true" >/dev/null 2>&1
-            successful+=("$name: Backup completed ($size) -> $backup_file")
-            log "BACKUP" "Successfully backed up $name"
+        log "BACKUP" "$name: Parent dir: $parent_dir, Dir name: $dir_name"
+        log "BACKUP" "$name: Will create archive at: $backup_path"
+        
+        # Build tar command step by step for clarity
+        local tar_cmd="cd $parent_dir && tar --exclude='*.corrupted' --exclude='*.bloom' --exclude='*.sqlite-wal' --exclude='*.sqlite-shm' -czf $backup_path $dir_name"
+        
+        log "BACKUP" "$name: Executing tar command: $tar_cmd"
+        
+        # Execute with explicit error capture
+        local tar_output_raw=$(ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 "$user@$ip" "echo '$pass' | sudo -S bash -c '$tar_cmd' 2>&1; echo \"EXIT_CODE:\$?\"" 2>&1)
+        
+        log "BACKUP" "$name: tar raw output (full): '$tar_output_raw'"
+        
+        # Extract exit code from output
+        local tar_exit=$(echo "$tar_output_raw" | grep "EXIT_CODE:" | sed 's/.*EXIT_CODE://g' | tr -d '[:space:]')
+        [[ -z "$tar_exit" ]] && tar_exit=255
+        
+        log "BACKUP" "$name: tar exit code: $tar_exit"
+        
+        # Clean the output (remove sudo prompts and exit code marker)
+        local tar_output=$(echo "$tar_output_raw" | sed 's/\[sudo\] password for [^:]*: //g' | grep -v "EXIT_CODE:")
+        log "BACKUP" "$name: tar cleaned output: '$tar_output'"
+        
+        # Exit code 0 = success, 1 = some files changed during backup (still usable), 2+ = error
+        if [[ $tar_exit -gt 1 ]]; then
+            failed+=("$name: Failed to create archive - exit code $tar_exit - $tar_output")
+            log "BACKUP" "FAILED - $name: tar command failed with exit code $tar_exit"
+            log "BACKUP" "FAILED - $name: tar output: $tar_output"
+            continue
+        elif [[ $tar_exit -eq 1 ]]; then
+            log "BACKUP" "$name: tar completed with warnings (exit 1): $tar_output"
+        fi
+        
+        log "BACKUP" "$name: tar command completed successfully"
+        
+        dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nVerifying archive..." 6 60
+        
+        # Verify the archive was created and get its size
+        local verify_output_raw=$(ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 "$user@$ip" "echo '$pass' | sudo -S ls -lh $backup_path 2>&1" 2>&1)
+        local verify_exit=$?
+        local verify_output=$(echo "$verify_output_raw" | sed 's/\[sudo\] password for [^:]*: //g' | grep -v "^Warning:" | grep -v "^Permanently" | tail -1)
+        
+        log "BACKUP" "$name: Verify exit code: $verify_exit"
+        log "BACKUP" "$name: Verify raw output: '$verify_output_raw'"
+        log "BACKUP" "$name: Verify cleaned output: '$verify_output'"
+        
+        if [[ $verify_exit -ne 0 || -z "$verify_output" ]]; then
+            failed+=("$name: Archive creation failed or file not found")
+            log "BACKUP" "FAILED - $name: Could not verify archive at $backup_path"
+            continue
+        fi
+        
+        local remote_size=$(echo "$verify_output" | awk '{print $5}')
+        log "BACKUP" "$name: Archive created successfully, size: $remote_size"
+        
+        # Change ownership of the archive to the SSH user for rsync access
+        dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nPreparing for download..." 6 60
+        
+        local chown_output=$(ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR "$user@$ip" "echo '$pass' | sudo -S chown $user:$user $backup_path 2>&1" 2>&1)
+        log "BACKUP" "$name: Changed ownership to $user: $chown_output"
+        
+        dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nDownloading archive...\n0% completed" 8 60
+        
+        # Download the archive using rsync with progress
+        local local_backup_file="$backup_dir/$backup_file"
+        
+        log "BACKUP" "$name: Starting rsync download to $local_backup_file"
+        
+        # Create a temporary file to capture rsync progress
+        local progress_file=$(mktemp)
+        local progress_log=$(mktemp)
+        
+        log "BACKUP" "$name: Starting rsync with progress monitoring"
+        
+        # Run rsync with progress output to a log file
+        (
+            rsync -avz --progress -e "ssh -p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR" \
+                "$user@$ip:$backup_path" "$local_backup_file" 2>&1 | tee "$progress_log" | \
+                while IFS= read -r line; do
+                    # Look for percentage in format like "  1,234,567  45%  123.45kB/s"
+                    if echo "$line" | grep -q '%'; then
+                        local pct=$(echo "$line" | grep -o '[0-9]\+%' | head -1 | tr -d '%')
+                        if [[ -n "$pct" ]]; then
+                            echo "$pct" > "$progress_file"
+                        fi
+                    fi
+                done
+        ) &
+        local rsync_pid=$!
+        
+        # Monitor progress with faster updates
+        local last_progress="0"
+        local check_count=0
+        while kill -0 $rsync_pid 2>/dev/null; do
+            if [[ -f "$progress_file" && -s "$progress_file" ]]; then
+                local current_progress=$(cat "$progress_file" 2>/dev/null | tail -1 | tr -d '[:space:]')
+                if [[ -n "$current_progress" && "$current_progress" =~ ^[0-9]+$ ]]; then
+                    if [[ "$current_progress" != "$last_progress" ]]; then
+                        dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nDownloading archive ($remote_size)...\n${current_progress}% completed" 8 60
+                        last_progress="$current_progress"
+                        log "BACKUP" "$name: Download progress: ${current_progress}%"
+                    fi
+                fi
+            fi
+            
+            # Update display even without progress change every 2 seconds
+            ((check_count++))
+            if [[ $((check_count % 20)) -eq 0 ]]; then
+                dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nDownloading archive ($remote_size)...\n${last_progress}% completed (transferring...)" 8 60
+            fi
+            
+            sleep 0.1
+        done
+        
+        wait $rsync_pid
+        local rsync_exit=$?
+        
+        log "BACKUP" "$name: rsync exit code: $rsync_exit"
+        log "BACKUP" "$name: rsync output: $(cat "$progress_log" 2>/dev/null)"
+        
+        rm -f "$progress_file" "$progress_log"
+        
+        # Check if file actually exists locally (more reliable than exit code)
+        if [[ -f "$local_backup_file" ]]; then
+            local local_size=$(ls -lh "$local_backup_file" 2>/dev/null | awk '{print $5}')
+            successful+=("$name: Downloaded successfully ($local_size) -> $backup_file")
+            log "BACKUP" "SUCCESS - $name: Downloaded to $local_backup_file (size: $local_size)"
+            
+            # Clean up remote file
+            dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nCleaning up remote server..." 6 60
+            ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR "$user@$ip" "echo '$pass' | sudo -S rm -f $backup_path" 2>/dev/null
+            log "BACKUP" "$name: Removed remote archive $backup_path"
         else
-            failed+=("$name: Failed to transfer backup")
-            ssh_exec "$ip" "$user" "$pass" "rm -f $remote_path" "Cleanup" "true" >/dev/null 2>&1
+            failed+=("$name: Download failed - file not found locally (rsync exit: $rsync_exit)")
+            log "BACKUP" "FAILED - $name: Local file not created. rsync exit code: $rsync_exit"
+            
+            # Still try to clean up remote file
+            ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR "$user@$ip" "echo '$pass' | sudo -S rm -f $backup_path" 2>/dev/null
+            log "BACKUP" "$name: Attempted cleanup of remote archive $backup_path"
         fi
     done
     
-    local info="📂 Backup Location: $backup_dir\n📝 Note: .bloom files excluded"
+    local info="📂 Local Backup Location: $backup_dir\n📦 Files excluded: *.corrupted, *.bloom, *.sqlite-wal, *.sqlite-shm\n🧹 Remote /tmp archives cleaned up"
     show_operation_results "💾 Node Backup" successful failed "$info"
 }
 
@@ -999,7 +1242,7 @@ test_ssh() {
     local pass=$(get_password "SSH Test" "SSH password for $user@$ip:")
     [[ -z "$pass" ]] && return
     
-    local results="🔧 SSH Test Results: $name ($ip:$SSH_PORT)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    local results="🔧 SSH Test Results: $name ($ip:$SSH_PORT)\n────────────────────────────────────────────────────────\n\n"
     
     local tests=(
         "Basic Connection:echo 'OK'"
