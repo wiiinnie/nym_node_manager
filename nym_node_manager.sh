@@ -1,27 +1,66 @@
 #!/bin/bash
 
 # ============================================================================
-# Nym Node Manager v58 - Fixed Restart Service Password Logging
+# Nym Node Manager v66 - Refined Wallet Display
 # ============================================================================
 # Description: Centralized management tool for Nym network nodes
-# Requirements: dialog, expect, curl, rsync, sshpass
-# Features: Multi-node operations, backup, updates, configuration management
-# Changelog v58:
-#   - Fixed password logging in restart_service function
-#   - Fixed sudo password prompt in service status check
-#   - Both functions now use use_root parameter properly
+# Requirements: dialog, expect, curl, rsync, sshpass, openssl, nym-cli, jq
+# Features: Multi-node operations, backup, updates, configuration, wallet mgmt
+# Changelog v66:
+#   - Renamed "Available Operator Rewards" to "Claimable operator rewards"
+#   - Renamed "Available Balance" to "Wallet balance"
+#   - Removed uNYM values from wallet list (only NYM shown)
+#   - Removed "Query available rewards" menu item (integrated into List wallets)
+#   - Swapped menu positions: "Withdraw operator rewards" now before "Create new transaction"
+# Changelog v65:
+#   - "List wallets" now queries and displays both balance and operator rewards
+#   - Enhanced wallet display format with address, rewards, and balance
+#   - Removed emojis from Wallet Operations menu and submenus
+#   - Extended window size for wallet list (35 rows x 100 columns)
+# Changelog v63:
+#   - Added "Create new transaction" feature to Wallet Operations
+#   - Query wallet balances and display with addresses
+#   - Multi-wallet transaction support (send max available from each)
+#   - Receiver address validation
+#   - Transaction confirmation before execution
+#   - Automatic uNYM conversion (1 NYM = 1,000,000 uNYM)
+# Changelog v62:
+#   - Wallets now displayed in alphabetical order in all operations
+#   - Improved wallet selection menu consistency
+# Changelog v61:
+#   - Fixed "Query available rewards" to correctly extract amount_earned.amount
+#   - Now properly parses the Nym API response structure
+#   - Verified secure encryption: mnemonics and passwords only in memory/encrypted
+# Changelog v60:
+#   - Added "Query available rewards" to Wallet Operations menu
+#   - Multi-wallet selection for batch rewards queries
+#   - Derives Nyx address from mnemonic using nym-cli
+#   - Queries pending operator rewards via REST API
+#   - Displays rewards in both uNYM and NYM formats
+#   - Select individual wallets or query all at once
+# Changelog v59:
+#   - Added Wallet Operations submenu at position 3
+#   - Integrated encrypted wallet management functions
+#   - Support for multiple wallets with AES-256 encryption
+#   - Operator rewards withdrawal functionality
+#   - Account balance checking
+#   - Moved previous menus (Configuration, Diagnostics) to positions 4-5
 # ============================================================================
 
 # ----------------------------------------------------------------------------
 # GLOBAL CONFIGURATION
 # ----------------------------------------------------------------------------
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 SCRIPT_NAME="Nym Node Manager"
-VERSION="58"
+VERSION="66"
 SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
 DEBUG_LOG="$SCRIPT_DIR/debug.log"
 NODES_FILE="$SCRIPT_DIR/nodes.txt"
 CONFIG_FILE="$SCRIPT_DIR/config.txt"
+
+# Wallet management configuration
+WALLET_DIR="$HOME/.nym_wallets"
+WALLET_LIST="$WALLET_DIR/wallet_list.txt"
 
 DEFAULT_SSH_PORT="22"
 DEFAULT_SERVICE_NAME="nym-node.service"
@@ -77,7 +116,7 @@ EOF
 
 check_deps() {
     local missing=()
-    for cmd in dialog expect curl rsync; do
+    for cmd in dialog expect curl rsync openssl jq; do
         command -v "$cmd" >/dev/null || missing+=("$cmd")
     done
     
@@ -91,6 +130,12 @@ check_deps() {
             echo -e "${RED}Install manually: ${missing[*]}${NC}"; exit 1
         fi
         echo -e "${GREEN}All packages installed!${NC}"
+    fi
+    
+    # Note: nym-cli is optional for wallet operations
+    if ! command -v nym-cli >/dev/null 2>&1; then
+        echo -e "${YELLOW}Note: nym-cli not found - wallet operations require nym-cli${NC}"
+        echo -e "${YELLOW}Download from: https://github.com/nymtech/nym/releases${NC}"
     fi
 }
 
@@ -190,175 +235,93 @@ remove_nodes_from_file() {
             for target in "${nodes_to_remove[@]}"; do
                 [[ "$current_name" == "$target" ]] && { in_target=true; break; }
             done
-            [[ ! "$in_target" == "true" ]] && { [[ -s "$temp" ]] && echo "" >> "$temp"; echo "$line" >> "$temp"; }
-        elif [[ ! "$in_target" == "true" ]]; then
-            echo "$line" >> "$temp"
         fi
+        [[ "$in_target" == "false" ]] && echo "$line" >> "$temp"
     done < "$NODES_FILE"
     mv "$temp" "$NODES_FILE"
 }
 
 # ----------------------------------------------------------------------------
-# SSH OPERATIONS
+# NODE MANAGEMENT
 # ----------------------------------------------------------------------------
 
-ssh_exec() {
-    local ip="$1" user="$2" pass="$3" cmd="$4" desc="${5:-SSH Command}" use_root="${6:-false}"
+add_node() {
+    local name=$(get_input "Add Node" "Enter node name:")
+    [[ -z "$name" ]] && return
     
-    log "SSH_EXEC" "Starting: $desc on $ip"
-    log "SSH_EXEC" "Original command: $cmd"
-    log "SSH_EXEC" "Use root: $use_root"
-    
-    # If root execution is needed, wrap the command appropriately
-    if [[ "$use_root" == "true" ]]; then
-        # Escape special characters for the nested command
-        local escaped_cmd=$(echo "$cmd" | sed 's/"/\\"/g')
-        cmd="echo '$pass' | sudo -S bash -c \"$escaped_cmd\""
-        log "SSH_EXEC" "Root command: $cmd"
+    if node_name_exists "$name"; then
+        show_error "Node name '$name' already exists!"
+        return
     fi
     
-    local expect_script=$(mktemp)
-    local output_file=$(mktemp)
+    local ip=$(get_input "Add Node" "Enter IP address for '$name':")
+    [[ -z "$ip" ]] && return
     
-    cat > "$expect_script" << EOF
-#!/usr/bin/expect -f
-set timeout 30
-set ip [lindex \$argv 0]; set user [lindex \$argv 1]; set password [lindex \$argv 2]
-set port [lindex \$argv 3]; set command [lindex \$argv 4]; set outfile [lindex \$argv 5]
-log_user 0
-set output ""
-spawn ssh -p \$port -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 \$user@\$ip \$command
-expect {
-    "password:" { 
-        send "\$password\r"
-        expect {
-            "Permission denied" { exit 1 }
-            eof {
-                set output \$expect_out(buffer)
-            }
-        }
-    }
-    "Are you sure you want to continue connecting" { 
-        send "yes\r"
-        exp_continue
-    }
-    timeout { exit 2 }
-    eof {
-        set output \$expect_out(buffer)
-    }
+    local node_id=$(get_input "Add Node" "Enter Node ID for '$name':")
+    [[ -z "$node_id" ]] && return
+    
+    insert_node_sorted "$name" "$ip" "$node_id"
+    show_success "Node '$name' added successfully!"
 }
-# Write only the command output to file
-set fd [open \$outfile w]
-puts -nonewline \$fd \$output
-close \$fd
-catch wait result
-exit [lindex \$result 3]
-EOF
-    
-    chmod 700 "$expect_script"
-    "$expect_script" "$ip" "$user" "$pass" "$SSH_PORT" "$cmd" "$output_file" 2>/dev/null
-    local exit_code=$?
-    
-    log "SSH_EXEC" "Exit code: $exit_code"
-    
-    local output=""
-    if [[ -f "$output_file" ]]; then
-        output=$(cat "$output_file")
-        log "SSH_EXEC" "Raw output before filtering: '$output'"
-        # Remove password prompt and sudo messages - but keep the actual command output
-        output=$(echo "$output" | sed 's/\[sudo\] password for [^:]*: //g' | sed 's/^Password: //g' | sed 's/^spawn.*$//g' | grep -v "^Permanently added" | grep -v "^Warning:" | sed '/^$/d')
-        log "SSH_EXEC" "Filtered output: '$output'"
+
+list_nodes() {
+    local names=() ips=() node_ids=()
+    if ! parse_nodes_file; then
+        show_msg "No Nodes" "No nodes configured. Add nodes first!"
+        return
     fi
     
-    rm -f "$expect_script" "$output_file"
-    
-    echo "$output"
-    return $exit_code
+    local output="📋 Configured Nodes:\n────────────────────────────────────────────────────────\n\n"
+    for ((i=0; i<${#names[@]}; i++)); do
+        output+="$((i+1)). ${names[i]}\n   IP: ${ips[i]}\n   Node ID: ${node_ids[i]}\n\n"
+    done
+    dialog --title "Node List" --msgbox "$output" 20 70
 }
 
-# New function to handle rsync with password using expect with detailed logging
-rsync_with_password() {
-    local user="$1" pass="$2" ip="$3" port="$4" remote_path="$5" local_path="$6"
+edit_node() {
+    select_nodes "single" "Edit Node" || return
+    local old_name="${SELECTED_NODES_NAMES[0]}" old_ip="${SELECTED_NODES_IPS[0]}" old_id="${SELECTED_NODES_IDS[0]}"
     
-    log "RSYNC" "Starting rsync transfer: $user@$ip:$remote_path -> $local_path (port: $port)"
+    local choice=$(dialog --clear --title "Edit Node: $old_name" --menu "What to edit?" 12 60 3 \
+        1 "Name (Current: $old_name)" \
+        2 "IP Address (Current: $old_ip)" \
+        3 "Node ID (Current: $old_id)" 3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && return
     
-    local expect_script=$(mktemp)
-    local log_file=$(mktemp)
-    
-    cat > "$expect_script" << 'EXPECTEOF'
-#!/usr/bin/expect -f
-set timeout 300
-
-if {[llength $argv] != 6} {
-    puts "Error: Expected 6 arguments"
-    exit 1
+    case $choice in
+        1)
+            local new_name=$(get_input "Edit Node Name" "New name for '$old_name':")
+            [[ -z "$new_name" || "$new_name" == "$old_name" ]] && return
+            if node_name_exists "$new_name"; then
+                show_error "Node name '$new_name' already exists!"
+                return
+            fi
+            remove_nodes_from_file "$old_name"
+            insert_node_sorted "$new_name" "$old_ip" "$old_id"
+            show_success "Node renamed to '$new_name'"
+            ;;
+        2)
+            local new_ip=$(get_input "Edit IP Address" "New IP for '$old_name':")
+            [[ -z "$new_ip" || "$new_ip" == "$old_ip" ]] && return
+            remove_nodes_from_file "$old_name"
+            insert_node_sorted "$old_name" "$new_ip" "$old_id"
+            show_success "IP updated for '$old_name'"
+            ;;
+        3)
+            local new_id=$(get_input "Edit Node ID" "New Node ID for '$old_name':")
+            [[ -z "$new_id" || "$new_id" == "$old_id" ]] && return
+            remove_nodes_from_file "$old_name"
+            insert_node_sorted "$old_name" "$old_ip" "$new_id"
+            show_success "Node ID updated for '$old_name'"
+            ;;
+    esac
 }
 
-set user [lindex $argv 0]
-set password [lindex $argv 1]
-set ip [lindex $argv 2]
-set port [lindex $argv 3]
-set remote_path [lindex $argv 4]
-set local_path [lindex $argv 5]
-
-log_user 1
-set timeout 300
-
-puts "DEBUG: Starting rsync spawn..."
-puts "DEBUG: Command: rsync -avz -e \"ssh -p $port -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR\" $user@$ip:$remote_path $local_path"
-
-spawn rsync -avz -e "ssh -p $port -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR" $user@$ip:$remote_path $local_path
-
-set password_sent 0
-
-expect {
-    -re "assword:" {
-        puts "DEBUG: Password prompt detected, sending password..."
-        send "$password\r"
-        set password_sent 1
-        exp_continue
-    }
-    "Are you sure you want to continue connecting" {
-        puts "DEBUG: Host key verification prompt detected..."
-        send "yes\r"
-        exp_continue
-    }
-    -re "Permission denied" {
-        puts "DEBUG: Permission denied error"
-        exit 1
-    }
-    timeout {
-        puts "DEBUG: Timeout waiting for response"
-        exit 2
-    }
-    eof {
-        puts "DEBUG: EOF received, password_sent=$password_sent"
-        catch wait result
-        set exit_code [lindex $result 3]
-        puts "DEBUG: Exit code: $exit_code"
-        exit $exit_code
-    }
-}
-EXPECTEOF
-    
-    chmod 700 "$expect_script"
-    
-    # Run expect script and capture all output
-    "$expect_script" "$user" "$pass" "$ip" "$port" "$remote_path" "$local_path" > "$log_file" 2>&1
-    local exit_code=$?
-    
-    # Log the output
-    if [[ -f "$log_file" ]]; then
-        log "RSYNC" "Expect script output:"
-        while IFS= read -r line; do
-            log "RSYNC" "  $line"
-        done < "$log_file"
-    fi
-    
-    log "RSYNC" "Rsync exit code: $exit_code"
-    
-    rm -f "$expect_script" "$log_file"
-    return $exit_code
+delete_node() {
+    select_nodes "multi" "Delete Nodes" || return
+    confirm "Delete ${#SELECTED_NODES_NAMES[@]} node(s)?" || return
+    remove_nodes_from_file "${SELECTED_NODES_NAMES[@]}"
+    show_success "${#SELECTED_NODES_NAMES[@]} node(s) deleted successfully!"
 }
 
 # ----------------------------------------------------------------------------
@@ -366,162 +329,135 @@ EXPECTEOF
 # ----------------------------------------------------------------------------
 
 select_nodes() {
-    local mode="${1:-single}" title="${2:-Select Node}"
+    local mode="$1" title="$2"
     SELECTED_NODES_NAMES=(); SELECTED_NODES_IPS=(); SELECTED_NODES_IDS=()
     
     local names=() ips=() node_ids=()
-    parse_nodes_file || { show_error "No nodes found. Add nodes first."; return 1; }
-    
-    local options=() counter=1
-    for ((i=0; i<${#names[@]}; i++)); do
-        if [[ "$mode" == "multi" ]]; then
-            options+=("$counter" "${names[i]} (${ips[i]})" "OFF")
-        else
-            options+=("$counter" "${names[i]} (${ips[i]})")
-        fi
-        ((counter++))
-    done
-    
-    local choices
-    if [[ "$mode" == "multi" ]]; then
-        local all_options=("ALL" "Select All Nodes" "OFF" "${options[@]}")
-        choices=$(dialog --title "$title" --checklist "Choose nodes (Space to select, Enter to confirm):" $((${#names[@]} + 10)) 70 $((${#names[@]} + 1)) "${all_options[@]}" 3>&1 1>&2 2>&3)
-    else
-        choices=$(dialog --title "$title" --menu "Choose node:" 15 60 10 "${options[@]}" 3>&1 1>&2 2>&3)
+    if ! parse_nodes_file; then
+        show_msg "No Nodes" "No nodes configured. Add nodes first!"
+        return 1
     fi
     
-    [[ $? -ne 0 ]] && return 1
+    if [[ "$mode" == "single" ]]; then
+        local options=()
+        for ((i=0; i<${#names[@]}; i++)); do
+            options+=("$((i+1))" "${names[i]} (${ips[i]})")
+        done
+        
+        local choice=$(dialog --clear --title "$title" --menu "Select a node:" 15 70 "${#names[@]}" "${options[@]}" 3>&1 1>&2 2>&3)
+        [[ $? -ne 0 ]] && return 1
+        
+        local idx=$((choice-1))
+        SELECTED_NODES_NAMES=("${names[idx]}")
+        SELECTED_NODES_IPS=("${ips[idx]}")
+        SELECTED_NODES_IDS=("${node_ids[idx]}")
+    else
+        local checklist=()
+        for ((i=0; i<${#names[@]}; i++)); do
+            checklist+=("$((i+1))" "${names[i]} (${ips[i]})" "off")
+        done
+        
+        local choices=$(dialog --clear --title "$title" --separate-output --checklist "Select nodes (Space=toggle, Enter=confirm):" 18 70 "${#names[@]}" "${checklist[@]}" 3>&1 1>&2 2>&3)
+        [[ $? -ne 0 || -z "$choices" ]] && return 1
+        
+        while IFS= read -r choice; do
+            local idx=$((choice-1))
+            SELECTED_NODES_NAMES+=("${names[idx]}")
+            SELECTED_NODES_IPS+=("${ips[idx]}")
+            SELECTED_NODES_IDS+=("${node_ids[idx]}")
+        done <<< "$choices"
+    fi
     
-    for choice in $choices; do
-        choice=$(echo "$choice" | tr -d '"')
-        if [[ "$choice" == "ALL" ]]; then
-            SELECTED_NODES_NAMES=("${names[@]}")
-            SELECTED_NODES_IPS=("${ips[@]}")
-            SELECTED_NODES_IDS=("${node_ids[@]}")
-            break
-        else
-            local idx=$((choice - 1))
-            SELECTED_NODES_NAMES+=("${names[$idx]}")
-            SELECTED_NODES_IPS+=("${ips[$idx]}")
-            SELECTED_NODES_IDS+=("${node_ids[$idx]}")
-        fi
-    done
-    
-    [[ ${#SELECTED_NODES_NAMES[@]} -eq 0 ]] && { show_error "No nodes selected."; return 1; }
     return 0
 }
 
 # ----------------------------------------------------------------------------
-# RESULTS DISPLAY
+# SSH OPERATIONS
 # ----------------------------------------------------------------------------
 
-show_operation_results() {
-    local operation="$1"
-    local -n success_arr="$2" fail_arr="$3"
-    local additional="${4:-}"
+ssh_exec() {
+    local ip="$1" user="$2" pass="$3" cmd="$4" desc="$5" needs_root="${6:-false}"
+    local timeout=30
     
-    local results="$operation Results\n────────────────────────────────────────────────────────\n\n"
-    [[ ${#success_arr[@]} -gt 0 ]] && {
-        results+="✅ Success (${#success_arr[@]} nodes):\n"
-        for item in "${success_arr[@]}"; do results+="   • $item\n"; done
-        results+="\n"
-    }
-    [[ ${#fail_arr[@]} -gt 0 ]] && {
-        results+="❌ Failed (${#fail_arr[@]} nodes):\n"
-        for item in "${fail_arr[@]}"; do results+="   • $item\n"; done
-        results+="\n"
-    }
-    [[ -n "$additional" ]] && results+="$additional\n"
-    show_success "$results"
+    log "SSH" "Executing on $ip: $desc"
+    
+    # Build command based on root access needs
+    local ssh_cmd="$cmd"
+    if [[ "$needs_root" == "true" ]]; then
+        # Check if user is root, otherwise use sudo
+        if [[ "$user" == "root" ]]; then
+            ssh_cmd="$cmd"
+        else
+            ssh_cmd="sudo -S bash -c '$cmd'"
+        fi
+    fi
+    
+    expect -c "
+        set timeout $timeout
+        log_user 0
+        spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=$timeout -p $SSH_PORT $user@$ip \"$ssh_cmd\"
+        expect {
+            \"assword:\" {
+                send \"$pass\r\"
+                expect {
+                    \"assword:\" {
+                        send \"$pass\r\"
+                        exp_continue
+                    }
+                    eof
+                }
+            }
+            eof
+        }
+        catch wait result
+        exit [lindex \$result 3]
+    " 2>/dev/null
 }
 
-# ----------------------------------------------------------------------------
-# NODE MANAGEMENT
-# ----------------------------------------------------------------------------
-
-list_nodes() {
-    [[ ! -f "$NODES_FILE" || ! -s "$NODES_FILE" ]] && { show_msg "No Nodes" "No nodes found."; return; }
-    sort_nodes_file
+batch_ssh_exec() {
+    local cmd="$1" desc="$2" needs_root="${3:-false}" show_progress="${4:-true}"
     
-    local content="" current_node=""
-    while IFS= read -r line; do
-        case "$line" in
-            "Node Name: "*) [[ -n "$current_node" ]] && content+="\n"
-                content+="🖥️ NODE: ${line#Node Name: }\n────────────────────────────────────────\n"; current_node="yes" ;;
-            "IP Address: "*) content+="🌐 IP: ${line#IP Address: }\n" ;;
-            "Node ID: "*) content+="🆔 ID: ${line#Node ID: }\n" ;;
-            "Build Version: "*) content+="📦 Version: ${line#Build Version: }\n" ;;
-            *"mixnode"*"true"*) content+="🔀 Mixnode: \Z2✅ Enabled\Zn\n" ;;
-            *"mixnode"*"false"*) content+="🔀 Mixnode: \Z1❌ Disabled\Zn\n" ;;
-            *"gateway"*"true"*) content+="🚪 Gateway: \Z2✅ Enabled\Zn\n" ;;
-            *"gateway"*"false"*) content+="🚪 Gateway: \Z1❌ Disabled\Zn\n" ;;
-            *"network requester"*"true"*) content+="🌐 Network Requester: \Z2✅ Enabled\Zn\n" ;;
-            *"network requester"*"false"*) content+="🌐 Network Requester: \Z1❌ Disabled\Zn\n" ;;
-            *"ip packet router"*"true"*) content+="📦 IP Packet Router: \Z2✅ Enabled\Zn\n" ;;
-            *"ip packet router"*"false"*) content+="📦 IP Packet Router: \Z1❌ Disabled\Zn\n" ;;
-            *"Wireguard Status: enabled"*) content+="🔒 WireGuard: \Z2✅ ${line#*Wireguard Status: }\Zn\n" ;;
-            *"Wireguard Status: disabled"*) content+="🔒 WireGuard: \Z1❌ Disabled\Zn\n" ;;
-        esac
-    done < "$NODES_FILE"
+    local user=$(get_input "SSH Credentials" "Enter SSH username (same for all nodes):")
+    [[ -z "$user" ]] && return
     
-    [[ -n "$content" ]] && dialog --title "Nym Network Nodes" --colors --msgbox "$content" 25 85 || show_msg "No Data" "No readable node data found."
-}
-
-add_node() {
-    local name="" attempt=0
-    while true; do
-        ((attempt++))
-        name=$(get_input "Add Node" "$([[ $attempt -eq 1 ]] && echo "Enter Node Name:" || echo "Node '$name' already exists!\n\nEnter a different Node Name:")")
-        [[ -z "$name" ]] && { show_msg "Cancelled" "Node creation cancelled."; return; }
-        node_name_exists "$name" || break
-    done
+    local pass=$(get_password "SSH Password" "Enter password for $user:")
+    [[ -z "$pass" ]] && return
     
-    local ip=$(get_input "Add Node" "Enter IP Address for '$name':")
-    [[ -z "$ip" ]] && { show_msg "Cancelled" "Node creation cancelled."; return; }
+    local results="🔧 Operation: $desc\n────────────────────────────────────────────────────────\n\n"
+    local success=0 failed=0
     
-    local node_id=$(get_input "Add Node" "Enter Node ID for '$name':\n(The ID used during node initialization)")
-    [[ -z "$node_id" ]] && { show_msg "Cancelled" "Node creation cancelled."; return; }
-    
-    insert_node_sorted "$name" "$ip" "$node_id"
-    show_success "Node '$name' added successfully!\nIP: $ip\nID: $node_id"
-}
-
-edit_node() {
-    select_nodes "single" "Edit Node" || return
-    
-    local old_name="${SELECTED_NODES_NAMES[0]}" old_ip="${SELECTED_NODES_IPS[0]}" old_id="${SELECTED_NODES_IDS[0]}"
-    local new_name="" attempt=0
-    
-    while true; do
-        ((attempt++))
-        new_name=$(dialog --title "Edit Node Name" --inputbox "$([[ $attempt -eq 1 ]] && echo "Enter new Node Name:" || echo "Node '$new_name' already exists!\n\nEnter a different Node Name:")" 8 50 "$old_name" 3>&1 1>&2 2>&3)
-        [[ $? -ne 0 || -z "$new_name" ]] && { show_msg "Cancelled" "Edit cancelled."; return; }
-        [[ "$new_name" == "$old_name" ]] && break
-        node_name_exists "$new_name" || break
-    done
-    
-    local new_ip=$(dialog --title "Edit IP Address" --inputbox "Enter new IP Address:" 8 50 "$old_ip" 3>&1 1>&2 2>&3)
-    [[ $? -ne 0 || -z "$new_ip" ]] && { show_msg "Cancelled" "Edit cancelled."; return; }
-    
-    local new_id=$(dialog --title "Edit Node ID" --inputbox "Enter new Node ID:" 8 50 "$old_id" 3>&1 1>&2 2>&3)
-    [[ $? -ne 0 || -z "$new_id" ]] && { show_msg "Cancelled" "Edit cancelled."; return; }
-    
-    remove_nodes_from_file "$old_name"
-    insert_node_sorted "$new_name" "$new_ip" "$new_id"
-    show_success "Node updated!\n\nOld: $old_name ($old_ip) - $old_id\nNew: $new_name ($new_ip) - $new_id"
-}
-
-delete_node() {
-    select_nodes "multi" "Delete Nodes" || return
-    
-    local node_list=""
     for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
-        node_list+="\n• ${SELECTED_NODES_NAMES[i]} (${SELECTED_NODES_IPS[i]})"
+        local name="${SELECTED_NODES_NAMES[i]}" ip="${SELECTED_NODES_IPS[i]}"
+        
+        [[ "$show_progress" == "true" ]] && dialog --title "Processing" --infobox "[$((i+1))/${#SELECTED_NODES_NAMES[@]}] $name..." 5 50
+        
+        if output=$(ssh_exec "$ip" "$user" "$pass" "$cmd" "$desc" "$needs_root" 2>&1); then
+            results+="✅ $name ($ip)\n"
+            [[ -n "$output" ]] && results+="   Output: $output\n"
+            ((success++))
+        else
+            results+="❌ $name ($ip) - FAILED\n"
+            ((failed++))
+        fi
+        results+="\n"
     done
     
-    confirm "Delete ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\nThis cannot be undone." || return
-    remove_nodes_from_file "${SELECTED_NODES_NAMES[@]}"
-    show_success "${#SELECTED_NODES_NAMES[@]} node(s) deleted successfully!"
+    results+="📊 Summary: $success succeeded, $failed failed"
+    dialog --title "Results" --msgbox "$results" 20 80
+}
+
+execute_ssh_command() {
+    select_nodes "multi" "Execute SSH Command" || return
+    
+    local cmd=$(dialog --title "SSH Command" --inputbox "Enter command to execute:" 8 70 3>&1 1>&2 2>&3)
+    [[ -z "$cmd" ]] && return
+    
+    local needs_root="false"
+    if confirm "Does this command require root/sudo access?"; then
+        needs_root="true"
+    fi
+    
+    batch_ssh_exec "$cmd" "Custom Command" "$needs_root" "true"
 }
 
 # ----------------------------------------------------------------------------
@@ -529,451 +465,1076 @@ delete_node() {
 # ----------------------------------------------------------------------------
 
 retrieve_node_roles() {
-    [[ ! -f "$NODES_FILE" || ! -s "$NODES_FILE" ]] && { show_error "No nodes found."; return; }
+    select_nodes "multi" "Retrieve Node Roles" || return
     
-    local clean_file=$(mktemp)
-    while IFS= read -r line; do
-        [[ "$line" =~ ^(Node\ Name:|IP\ Address:|Node\ ID:) || -z "$line" ]] && echo "$line" >> "$clean_file"
-    done < "$NODES_FILE"
+    local user=$(get_input "SSH Credentials" "Enter SSH username:")
+    [[ -z "$user" ]] && return
     
-    local names=() ips=() node_ids=()
-    parse_nodes_file
-    local total=${#names[@]} processed=0
+    local pass=$(get_password "SSH Password" "Enter password for $user:")
+    [[ -z "$pass" ]] && return
     
-    local temp=$(mktemp)
-    for ((i=0; i<total; i++)); do
-        local name="${names[i]}" ip="${ips[i]}" node_id="${node_ids[i]}"
-        ((processed++))
-        dialog --title "Retrieving Roles" --infobox "Processing $name ($processed/$total)..." 6 50
+    local results="🎭 Node Roles Report\n────────────────────────────────────────────────────────\n\n"
+    
+    for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
+        local name="${SELECTED_NODES_NAMES[i]}" ip="${SELECTED_NODES_IPS[i]}" node_id="${SELECTED_NODES_IDS[i]}"
         
-        echo -e "Node Name: $name\nIP Address: $ip\nNode ID: $node_id" >> "$temp"
+        dialog --title "Retrieving Roles" --infobox "[$((i+1))/${#SELECTED_NODES_NAMES[@]}] Checking $name..." 5 50
         
-        local roles=$(curl -s --connect-timeout 5 --max-time 10 "http://$ip:8080/api/v1/roles" 2>/dev/null)
-        local gateway=$(curl -s --connect-timeout 5 --max-time 10 "http://$ip:8080/api/v1/gateway" 2>/dev/null)
-        local build_info=$(curl -s --connect-timeout 5 --max-time 10 "http://$ip:8080/api/v1/build-information" 2>/dev/null)
+        local cmd="cd $BINARY_PATH && ./nym-node node-details --id $node_id 2>/dev/null | grep -E '(mixnode_mode|entry_gateway_mode|exit_gateway_mode)' | awk '{print \$1, \$2}'"
         
-        if [[ -n "$roles" ]]; then
-            for field in mixnode_enabled gateway_enabled network_requester_enabled ip_packet_router_enabled; do
-                local label=$(echo "$field" | sed 's/_/ /g' | sed 's/\b\(.\)/\u\1/g')
-                echo "$label: $(echo "$roles" | grep -o "\"$field\"[[:space:]]*:[[:space:]]*[^,}]*" | cut -d':' -f2 | tr -d ' ",' || echo "unknown")" >> "$temp"
-            done
-        else
-            echo -e "Mixnode Enabled: error\nGateway Enabled: error\nNetwork Requester Enabled: error\nIP Packet Router Enabled: error" >> "$temp"
-        fi
-        
-        if [[ -n "$gateway" ]]; then
-            if echo "$gateway" | grep -q '"wireguard"[[:space:]]*:[[:space:]]*null'; then
-                echo "Wireguard Status: disabled" >> "$temp"
-            elif echo "$gateway" | grep -q '"wireguard"[[:space:]]*:[[:space:]]*{'; then
-                local port=$(echo "$gateway" | grep -o '"port"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*')
-                echo "Wireguard Status: enabled${port:+ (port: $port)}" >> "$temp"
+        if output=$(ssh_exec "$ip" "$user" "$pass" "$cmd" "Get node roles" "false" 2>&1); then
+            results+="✅ $name ($ip)\n"
+            if [[ -n "$output" ]]; then
+                results+="$output\n"
             else
-                echo "Wireguard Status: unknown" >> "$temp"
+                results+="   No roles found or command failed\n"
             fi
         else
-            echo "Wireguard Status: error" >> "$temp"
+            results+="❌ $name - Connection failed\n"
         fi
-        
-        [[ -n "$build_info" ]] && echo "Build Version: $(echo "$build_info" | grep -o '"build_version"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d':' -f2 | tr -d ' "' || echo "unknown")" >> "$temp" || echo "Build Version: error" >> "$temp"
-        [[ $i -lt $((total - 1)) ]] && echo >> "$temp"
+        results+="\n"
     done
     
-    rm -f "$clean_file"
-    mv "$temp" "$NODES_FILE"
-    sort_nodes_file
-    show_success "Node roles retrieved for $processed nodes!"
+    dialog --title "Node Roles" --msgbox "$results" 20 80
 }
 
 backup_node() {
-    log "BACKUP" "Starting backup_node function"
-    command -v rsync >/dev/null 2>&1 || { show_error "rsync is not installed on this machine.\n\nPlease install it:\n- Debian/Ubuntu: sudo apt-get install rsync\n- macOS: brew install rsync"; return; }
-    command -v expect >/dev/null 2>&1 || { show_error "expect is not installed on this machine.\n\nPlease install it:\n- Debian/Ubuntu: sudo apt-get install expect\n- macOS: brew install expect"; return; }
+    select_nodes "single" "Backup Node" || return
+    local name="${SELECTED_NODES_NAMES[0]}" ip="${SELECTED_NODES_IPS[0]}" node_id="${SELECTED_NODES_IDS[0]}"
     
-    select_nodes "multi" "Backup Nodes" || return
-    log "BACKUP" "Nodes selected: ${#SELECTED_NODES_NAMES[@]}"
+    local user=$(get_input "SSH Credentials" "SSH username for $name:")
+    [[ -z "$user" ]] && return
     
-    local user=$(get_input "SSH Connection" "SSH username (same for all):")
-    [[ -z "$user" ]] && { show_msg "Cancelled" "Backup cancelled."; return; }
-    log "BACKUP" "Username entered: $user"
+    local pass=$(get_password "SSH Password" "Password for $user@$ip:")
+    [[ -z "$pass" ]] && return
     
-    local pass=$(get_password "SSH Connection" "SSH password for $user:")
-    [[ -z "$pass" ]] && { show_msg "Cancelled" "Backup cancelled."; return; }
-    log "BACKUP" "Password entered (length: ${#pass})"
+    local backup_dir="$HOME/nym_backups/${name}_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$backup_dir"
     
-    local backup_dir=$(get_input "Backup Destination" "Enter local backup directory:\n(Leave empty for: $SCRIPT_DIR)")
-    [[ -z "$backup_dir" ]] && backup_dir="$SCRIPT_DIR"
+    dialog --title "Backup Progress" --infobox "Creating backup for $name...\nThis may take several minutes..." 6 50
     
-    [[ ! -d "$backup_dir" ]] && { mkdir -p "$backup_dir" 2>/dev/null || { show_error "Cannot create: $backup_dir"; return; }; }
-    backup_dir=$(cd "$backup_dir" && pwd)
-    log "BACKUP" "Backup directory: $backup_dir"
-    
-    local node_list=""
-    for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
-        node_list+="\n• ${SELECTED_NODES_NAMES[i]} (${SELECTED_NODES_IPS[i]})"
-    done
-    confirm "Backup ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\nLocal destination: $backup_dir" || return
-    
-    local successful=() failed=()
-    local total=${#SELECTED_NODES_NAMES[@]} current=0 timestamp=$(date +%Y%m%d_%H%M%S)
-    
-    for ((i=0; i<total; i++)); do
-        local name="${SELECTED_NODES_NAMES[i]}" ip="${SELECTED_NODES_IPS[i]}" node_id="${SELECTED_NODES_IDS[i]}"
-        ((current++))
-        log "BACKUP" "Processing node $current/$total: $name ($ip)"
-        
-        dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nTesting connection..." 6 60
-        log "BACKUP" "Step 1: Testing SSH connection to $ip"
-        ssh_exec "$ip" "$user" "$pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1
-        if [[ $? -ne 0 ]]; then
-            log "BACKUP" "SSH connection test FAILED for $name"
-            failed+=("$name: SSH connection failed")
-            continue
-        fi
-        log "BACKUP" "SSH connection test SUCCESS for $name"
-        
-        dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nChecking rsync..." 6 60
-        log "BACKUP" "Step 2: Checking rsync on remote server"
-        local remote_rsync_check=$(ssh_exec "$ip" "$user" "$pass" "command -v rsync >/dev/null && rsync --version 2>/dev/null | head -1" "Check rsync" 2>/dev/null)
-        log "BACKUP" "Remote rsync check result: $remote_rsync_check"
-        
-        if [[ -z "$remote_rsync_check" ]]; then
-            log "BACKUP" "Step 3: Installing rsync on remote server"
-            dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nInstalling rsync..." 6 60
-            ssh_exec "$ip" "$user" "$pass" "apt-get update >/dev/null 2>&1 && apt-get install -y rsync 2>&1" "Install rsync" "true" >/dev/null 2>&1
-            remote_rsync_check=$(ssh_exec "$ip" "$user" "$pass" "rsync --version 2>/dev/null | head -1" "Verify rsync" 2>/dev/null)
-            if [[ -z "$remote_rsync_check" ]]; then
-                log "BACKUP" "Failed to install rsync on $name"
-                failed+=("$name: Could not install rsync on remote server")
-                continue
-            fi
-            log "BACKUP" "Rsync installed successfully on $name"
-        fi
-        
-        dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nDetermining service user..." 6 60
-        log "BACKUP" "Step 4: Determining service user"
-        local check_user_cmd="if [ -f /etc/systemd/system/$SERVICE_NAME ]; then grep '^User=' /etc/systemd/system/$SERVICE_NAME | cut -d'=' -f2 | head -1; else echo 'NOFILE'; fi"
-        local service_user=$(ssh_exec "$ip" "$user" "$pass" "$check_user_cmd" "Get service user" "true" 2>/dev/null | tr -d '[:space:]')
-        
-        [[ -z "$service_user" || "$service_user" == "NOFILE" ]] && service_user="root"
-        local nym_path=$([[ "$service_user" == "root" ]] && echo "/root/.nym" || echo "/home/$service_user/.nym")
-        log "BACKUP" "Service user: $service_user, nym_path: $nym_path"
-        
-        dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nChecking folder access..." 6 60
-        log "BACKUP" "Step 5: Checking folder access for: $nym_path"
-        
-        # First try with root
-        local folder_check_raw=$(ssh_exec "$ip" "$user" "$pass" "[ -d $nym_path ] && echo EXISTS || echo NOTFOUND" "Check folder" "true" 2>&1)
-        log "BACKUP" "Raw folder check output: '$folder_check_raw'"
-        
-        local folder_check=$(echo "$folder_check_raw" | grep -o "EXISTS\|NOTFOUND" | head -1)
-        log "BACKUP" "Filtered folder check result: '$folder_check'"
-        
-        # If empty, try alternative method
-        if [[ -z "$folder_check" ]]; then
-            log "BACKUP" "First method failed, trying alternative with ls"
-            folder_check_raw=$(ssh_exec "$ip" "$user" "$pass" "ls -ld $nym_path 2>/dev/null && echo EXISTS || echo NOTFOUND" "Check folder alt" "true" 2>&1)
-            log "BACKUP" "Alternative raw output: '$folder_check_raw'"
-            folder_check=$(echo "$folder_check_raw" | grep -o "EXISTS\|NOTFOUND" | tail -1)
-            log "BACKUP" "Alternative filtered result: '$folder_check'"
-        fi
-        
-        if [[ "$folder_check" != "EXISTS" ]]; then
-            log "BACKUP" "Folder not found or inaccessible: $nym_path"
-            failed+=("$name: .nym folder not found at $nym_path")
-            continue
-        fi
-        log "BACKUP" "Folder exists: $nym_path"
-        
-        dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nCreating archive..." 6 60
-        log "BACKUP" "Step 6: Creating tar archive"
-        
-        local backup_file="nym_backup_${name}_${timestamp}.tar.gz"
-        local backup_path="/tmp/$backup_file"
-        local parent_dir=$(dirname "$nym_path")
-        local dir_name=$(basename "$nym_path")
-        local tar_cmd="cd $parent_dir && tar --exclude='*.corrupted' --exclude='*.bloom' --exclude='*.sqlite-wal' --exclude='*.sqlite-shm' -czf $backup_path $dir_name; echo \"EXIT_CODE:\$?\""
-        
-        log "BACKUP" "Tar command: $tar_cmd"
-        local tar_output=$(ssh_exec "$ip" "$user" "$pass" "$tar_cmd" "Create archive" "true" 2>/dev/null)
-        local tar_exit=$(echo "$tar_output" | grep "EXIT_CODE:" | sed 's/.*EXIT_CODE://g' | tr -d '[:space:]')
-        [[ -z "$tar_exit" ]] && tar_exit=255
-        
-        log "BACKUP" "Tar exit code: $tar_exit"
-        if [[ $tar_exit -gt 1 ]]; then
-            log "BACKUP" "Tar creation failed"
-            failed+=("$name: Failed to create archive - exit code $tar_exit")
-            continue
-        fi
-        
-        dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nVerifying archive..." 6 60
-        log "BACKUP" "Step 7: Verifying archive"
-        local verify_output=$(ssh_exec "$ip" "$user" "$pass" "ls -lh $backup_path" "Verify archive" "true" 2>/dev/null)
-        
-        log "BACKUP" "Verify output: $verify_output"
-        if [[ -z "$verify_output" ]]; then
-            log "BACKUP" "Archive verification failed"
-            failed+=("$name: Archive creation failed or file not found")
-            continue
-        fi
-        
-        local remote_size=$(echo "$verify_output" | awk '{print $5}')
-        log "BACKUP" "Archive size: $remote_size"
-        
-        dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\nPreparing for download..." 6 60
-        log "BACKUP" "Step 8: Changing ownership for download"
-        ssh_exec "$ip" "$user" "$pass" "chown $user:$user $backup_path" "Change ownership" "true" >/dev/null 2>&1
-        
-        local local_backup_file="$backup_dir/$backup_file"
-        
-        dialog --title "Backing Up" --infobox "Processing $name ($current/$total)...\n\nStarting download...\nFile size: $remote_size\n\nThis may take several minutes depending on\nthe archive size and network speed.\n\nPlease wait..." 12 60
-        
-        log "BACKUP" "Step 9: Starting rsync download"
-        log "BACKUP" "Remote path: $backup_path, Local path: $local_backup_file"
-        
-        # Use the new rsync_with_password function instead of direct rsync
-        rsync_with_password "$user" "$pass" "$ip" "$SSH_PORT" "$backup_path" "$local_backup_file"
-        local rsync_exit=$?
-        
-        log "BACKUP" "Rsync completed with exit code: $rsync_exit"
-        
-        if [[ -f "$local_backup_file" ]]; then
-            local local_size=$(ls -lh "$local_backup_file" 2>/dev/null | awk '{print $5}')
-            log "BACKUP" "Backup successful, local file size: $local_size"
-            successful+=("$name: Downloaded successfully ($local_size) -> $backup_file")
-            log "BACKUP" "Step 10: Cleaning up remote archive"
-            ssh_exec "$ip" "$user" "$pass" "rm -f $backup_path" "Cleanup" "true" >/dev/null 2>&1
+    # Use rsync with sshpass for backup
+    if command -v sshpass >/dev/null 2>&1; then
+        if sshpass -p "$pass" rsync -avz -e "ssh -o StrictHostKeyChecking=no -p $SSH_PORT" \
+            "$user@$ip:/root/.nym/nym-nodes/$node_id/" "$backup_dir/" 2>&1 | tee -a "$DEBUG_LOG"; then
+            show_success "Backup completed!\n\nLocation: $backup_dir"
         else
-            log "BACKUP" "Backup failed, local file not found"
-            failed+=("$name: Download failed - file not found locally (rsync exit: $rsync_exit)")
-            log "BACKUP" "Step 10: Cleaning up remote archive (failed backup)"
-            ssh_exec "$ip" "$user" "$pass" "rm -f $backup_path" "Cleanup" "true" >/dev/null 2>&1
+            show_error "Backup failed! Check $DEBUG_LOG for details."
         fi
-    done
-    
-    log "BACKUP" "Backup operation completed. Success: ${#successful[@]}, Failed: ${#failed[@]}"
-    local info="📂 Local Backup Location: $backup_dir\n📦 Files excluded: *.corrupted, *.bloom, *.sqlite-wal, *.sqlite-shm\n🧹 Remote /tmp archives cleaned up"
-    show_operation_results "💾 Node Backup" successful failed "$info"
+    else
+        show_error "sshpass not installed. Install it to use this feature:\nsudo apt-get install sshpass"
+    fi
 }
 
 update_nym_node() {
-    local url=$(get_input "Nym-Node Update" "Enter download URL for latest binary:\n\nExample:\nhttps://github.com/nymtech/nym/releases/download/nym-binaries-v2025.13-emmental/nym-node")
-    [[ -z "$url" ]] && { show_msg "Cancelled" "Update cancelled."; return; }
+    select_nodes "multi" "Update Nym-Node Binary" || return
     
-    select_nodes "multi" "Update Nodes" || return
+    local url=$(get_input "Update Binary" "Enter download URL for nym-node binary:")
+    [[ -z "$url" ]] && return
     
-    local user=$(get_input "SSH Connection" "SSH username (same for all):")
-    [[ -z "$user" ]] && { show_msg "Cancelled" "Update cancelled."; return; }
+    confirm "Update ${#SELECTED_NODES_NAMES[@]} node(s) with binary from:\n$url\n\nThis will:\n1. Stop the service\n2. Backup old binary\n3. Download new binary\n4. Make executable\n5. Restart service" || return
     
-    local pass=$(get_password "SSH Connection" "SSH password for $user:")
-    [[ -z "$pass" ]] && { show_msg "Cancelled" "Update cancelled."; return; }
+    local cmd="
+        systemctl stop $SERVICE_NAME &&
+        cd $BINARY_PATH &&
+        mv nym-node nym-node.backup.\$(date +%Y%m%d_%H%M%S) &&
+        curl -L '$url' -o nym-node &&
+        chmod +x nym-node &&
+        systemctl start $SERVICE_NAME &&
+        sleep 2 &&
+        systemctl status $SERVICE_NAME | head -10
+    "
     
-    local node_list=""
-    for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
-        node_list+="\n• ${SELECTED_NODES_NAMES[i]} (${SELECTED_NODES_IPS[i]})"
-    done
-    confirm "Update nym-node on ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\nURL: $url" || return
-    
-    local successful=() failed=()
-    local total=${#SELECTED_NODES_NAMES[@]} current=0
-    
-    for ((i=0; i<total; i++)); do
-        local name="${SELECTED_NODES_NAMES[i]}" ip="${SELECTED_NODES_IPS[i]}"
-        ((current++))
-        
-        dialog --title "Updating Nym-Node" --infobox "Processing $name ($current/$total)...\nTesting connection..." 6 60
-        ssh_exec "$ip" "$user" "$pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1 || { failed+=("$name: SSH connection failed"); continue; }
-        
-        dialog --title "Updating Nym-Node" --infobox "Processing $name ($current/$total)...\nPreparing..." 6 60
-        local prep_cmd="mkdir -p $BINARY_PATH/old && cd $BINARY_PATH && if [ -f nym-node ]; then mv nym-node old/nym-node.backup.\$(date +%Y%m%d_%H%M%S) || true; fi"
-        ssh_exec "$ip" "$user" "$pass" "$prep_cmd" "Prepare Directory" "true" >/dev/null 2>&1 || { failed+=("$name: Could not prepare directory"); continue; }
-        
-        dialog --title "Updating Nym-Node" --infobox "Processing $name ($current/$total)...\nDownloading..." 6 60
-        local dl_cmd="cd $BINARY_PATH && curl -L -o nym-node '$url' && chmod +x nym-node"
-        ssh_exec "$ip" "$user" "$pass" "$dl_cmd" "Download Binary" "true" >/dev/null 2>&1 || { failed+=("$name: Could not download binary"); continue; }
-        
-        dialog --title "Updating Nym-Node" --infobox "Processing $name ($current/$total)...\nVerifying..." 6 60
-        local version_output=$(ssh_exec "$ip" "$user" "$pass" "cd $BINARY_PATH && ./nym-node --version" "Check Version" "true" 2>/dev/null)
-        
-        if [[ $? -eq 0 && -n "$version_output" ]]; then
-            local version=$(echo "$version_output" | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1)
-            [[ -z "$version" ]] && version="unknown (functional)"
-            successful+=("$name: Updated to version $version")
-        else
-            failed+=("$name: Could not verify new binary")
-        fi
-    done
-    
-    local info="⚠️ IMPORTANT: Restart $SERVICE_NAME on updated nodes\n   Use 'Restart service' in Node Operations menu\n\n💾 Old binaries backed up to $BINARY_PATH/old/"
-    show_operation_results "🔄 Nym-Node Update" successful failed "$info"
+    batch_ssh_exec "$cmd" "Update nym-node binary" "true" "true"
 }
 
 toggle_node_functionality() {
-    select_nodes "multi" "Configure Nodes" || return
+    select_nodes "single" "Toggle Functionality" || return
+    local name="${SELECTED_NODES_NAMES[0]}" ip="${SELECTED_NODES_IPS[0]}" node_id="${SELECTED_NODES_IDS[0]}"
     
-    local user=$(get_input "SSH Connection" "SSH username (same for all):")
-    [[ -z "$user" ]] && { show_msg "Cancelled" "Configuration cancelled."; return; }
+    local user=$(get_input "SSH Credentials" "SSH username for $name:")
+    [[ -z "$user" ]] && return
     
-    local pass=$(get_password "SSH Connection" "SSH password for $user:")
-    [[ -z "$pass" ]] && { show_msg "Cancelled" "Configuration cancelled."; return; }
+    local pass=$(get_password "SSH Password" "Password for $user@$ip:")
+    [[ -z "$pass" ]] && return
     
-    ssh_exec "${SELECTED_NODES_IPS[0]}" "$user" "$pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1 || { show_error "SSH connection failed. Check credentials."; return; }
-    
-    local wg_choice=$(dialog --title "Wireguard Configuration" --radiolist "Select Wireguard setting:" 12 60 2 \
-        "enabled" "Enable Wireguard" "OFF" "disabled" "Disable Wireguard" "ON" 3>&1 1>&2 2>&3)
+    local choice=$(dialog --clear --title "Toggle Functionality: $name" --menu "Select mode to toggle:" 12 60 3 \
+        1 "Toggle Mixnode" \
+        2 "Toggle Entry Gateway" \
+        3 "Toggle Exit Gateway" 3>&1 1>&2 2>&3)
     [[ $? -ne 0 ]] && return
     
-    local mode_choice=$(dialog --title "Mixnet Mode Configuration" --radiolist "Select mode:" 14 60 3 \
-        "entry-gateway" "Entry Gateway" "OFF" "exit-gateway" "Exit Gateway" "OFF" "mixnode" "Mixnode" "ON" 3>&1 1>&2 2>&3)
-    [[ $? -ne 0 ]] && return
+    local mode_flag=""
+    case $choice in
+        1) mode_flag="mixnode" ;;
+        2) mode_flag="entry-gateway" ;;
+        3) mode_flag="exit-gateway" ;;
+    esac
     
-    local node_list=""
-    for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
-        node_list+="\n• ${SELECTED_NODES_NAMES[i]} (${SELECTED_NODES_IPS[i]})"
-    done
-    confirm "Apply configuration to ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\n• Wireguard: $wg_choice\n• Mode: $mode_choice" || return
+    dialog --title "Processing" --infobox "Toggling $mode_flag for $name..." 5 50
     
-    local successful=() failed=()
-    local total=${#SELECTED_NODES_NAMES[@]} current=0
+    local cmd="cd $BINARY_PATH && systemctl stop $SERVICE_NAME && ./nym-node mode --id $node_id --mode $mode_flag && systemctl start $SERVICE_NAME && sleep 2 && systemctl status $SERVICE_NAME | head -5"
     
-    for ((i=0; i<total; i++)); do
-        local name="${SELECTED_NODES_NAMES[i]}" ip="${SELECTED_NODES_IPS[i]}" node_id="${SELECTED_NODES_IDS[i]}"
-        ((current++))
-        
-        dialog --title "Configuring Nodes" --infobox "Processing $name ($current/$total)..." 6 60
-        ssh_exec "$ip" "$user" "$pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1 || { failed+=("$name: SSH connection failed"); continue; }
-        
-        local service_user=$(ssh_exec "$ip" "$user" "$pass" "grep '^User=' /etc/systemd/system/$SERVICE_NAME | cut -d'=' -f2" "Get User" "true" 2>/dev/null)
-        [[ -z "$service_user" ]] && service_user="root"
-        local config_path=$([[ "$service_user" == "root" ]] && echo "/root/.nym/nym-nodes/$node_id/config/config.toml" || echo "/home/$service_user/.nym/nym-nodes/$node_id/config/config.toml")
-        
-        local service_updated=false config_updated=false
-        local has_flags=$(ssh_exec "$ip" "$user" "$pass" "grep -E '(--wireguard-enabled|--mode)' /etc/systemd/system/$SERVICE_NAME" "Check Flags" "true" 2>/dev/null)
-        
-        if [[ -n "$has_flags" ]]; then
-            local wg_flag=$([[ "$wg_choice" = "enabled" ]] && echo "true" || echo "false")
-            local update_cmd="cp /etc/systemd/system/$SERVICE_NAME /etc/systemd/system/$SERVICE_NAME.backup.\$(date +%Y%m%d_%H%M%S) && "
-            update_cmd+="sed -i 's/--wireguard-enabled [^ ]*/--wireguard-enabled $wg_flag/g; t wg; s/\\(ExecStart=[^ ]* run\\)/\\1 --wireguard-enabled $wg_flag/; :wg' /etc/systemd/system/$SERVICE_NAME && "
-            update_cmd+="sed -i 's/--mode [^ ]*/--mode $mode_choice/g; t mode; s/\\(ExecStart=[^ ]* run\\)/\\1 --mode $mode_choice/; :mode' /etc/systemd/system/$SERVICE_NAME && "
-            update_cmd+="systemctl daemon-reload"
-            ssh_exec "$ip" "$user" "$pass" "$update_cmd" "Update Service" "true" >/dev/null 2>&1 && service_updated=true
-        fi
-        
-        local config_exists=$(ssh_exec "$ip" "$user" "$pass" "test -f $config_path && echo 'exists'" "Check Config" "true" 2>/dev/null)
-        if [[ "$config_exists" == "exists" ]]; then
-            local mixnode_val="false" entry_val="false" exit_val="false"
-            case "$mode_choice" in
-                "mixnode") mixnode_val="true" ;;
-                "entry-gateway") entry_val="true" ;;
-                "exit-gateway") exit_val="true" ;;
-            esac
-            
-            local wg_toml=$([[ "$wg_choice" = "enabled" ]] && echo "true" || echo "false")
-            local config_cmd="cp $config_path ${config_path}.backup.\$(date +%Y%m%d_%H%M%S) && "
-            config_cmd+="sed -i '/^\[modes\]/,/^\[/ { s/^mixnode = .*/mixnode = $mixnode_val/; s/^entry = .*/entry = $entry_val/; s/^exit = .*/exit = $exit_val/; }' $config_path && "
-            config_cmd+="sed -i '/^\[wireguard\]/,/^\[/ { s/^enabled = .*/enabled = $wg_toml/; }' $config_path"
-            ssh_exec "$ip" "$user" "$pass" "$config_cmd" "Update Config" "true" >/dev/null 2>&1 && config_updated=true
-        fi
-        
-        if [[ "$service_updated" == "true" || "$config_updated" == "true" ]]; then
-            local method=""
-            [[ "$service_updated" == "true" && "$config_updated" == "true" ]] && method="service & config.toml"
-            [[ "$service_updated" == "true" && "$config_updated" == "false" ]] && method="service file"
-            [[ "$service_updated" == "false" && "$config_updated" == "true" ]] && method="config.toml"
-            successful+=("$name: Updated ($method)")
-        else
-            failed+=("$name: Failed to update configuration")
-        fi
-    done
-    
-    local info="Applied Configuration:\n   • Wireguard: $wg_choice\n   • Mode: $mode_choice\n\n⚠️ IMPORTANT: Restart services on updated nodes"
-    show_operation_results "🔧 Node Configuration" successful failed "$info"
+    if output=$(ssh_exec "$ip" "$user" "$pass" "$cmd" "Toggle $mode_flag" "true" 2>&1); then
+        show_success "Mode toggled successfully for $name!\n\nService Status:\n$output"
+    else
+        show_error "Failed to toggle mode for $name"
+    fi
 }
 
 restart_service() {
     select_nodes "multi" "Restart Service" || return
-    
-    local user=$(get_input "SSH Connection" "SSH username (same for all):")
-    [[ -z "$user" ]] && { show_msg "Cancelled" "Restart cancelled."; return; }
-    
-    local pass=$(get_password "SSH Connection" "SSH password for $user:")
-    [[ -z "$pass" ]] && { show_msg "Cancelled" "Restart cancelled."; return; }
-    
-    local node_list=""
-    for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
-        node_list+="\n• ${SELECTED_NODES_NAMES[i]} (${SELECTED_NODES_IPS[i]})"
-    done
-    confirm "Restart $SERVICE_NAME on ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list" || return
-    
-    local successful=() failed=()
-    local total=${#SELECTED_NODES_NAMES[@]} current=0
-    
-    for ((i=0; i<total; i++)); do
-        local name="${SELECTED_NODES_NAMES[i]}" ip="${SELECTED_NODES_IPS[i]}"
-        ((current++))
-        
-        dialog --title "Restarting Services" --infobox "Processing $name ($current/$total)..." 6 60
-        ssh_exec "$ip" "$user" "$pass" "echo 'OK'" "Connection Test" >/dev/null 2>&1 || { failed+=("$name: SSH connection failed"); continue; }
-        
-        # Use use_root parameter instead of embedding password in command
-        if ssh_exec "$ip" "$user" "$pass" "systemctl restart $SERVICE_NAME" "Restart" "true" >/dev/null 2>&1; then
-            sleep 2
-            # Use use_root parameter for status check as well
-            local status=$(ssh_exec "$ip" "$user" "$pass" "systemctl is-active $SERVICE_NAME" "Status Check" "true" 2>/dev/null)
-            [[ -n "$status" ]] && successful+=("$name: Restarted (Status: $status)") || successful+=("$name: Restarted")
-        else
-            failed+=("$name: Failed to restart service")
-        fi
-    done
-    
-    show_operation_results "🔄 Service Restart" successful failed "🎯 Service Restart Complete!"
+    confirm "Restart service on ${#SELECTED_NODES_NAMES[@]} node(s)?" || return
+    batch_ssh_exec "systemctl restart $SERVICE_NAME && sleep 2 && systemctl status $SERVICE_NAME | head -5" "Restart $SERVICE_NAME" "true" "true"
 }
 
-execute_ssh_command() {
-    select_nodes "multi" "Execute SSH Command" || return
+# ----------------------------------------------------------------------------
+# WALLET MANAGEMENT FUNCTIONS
+# ----------------------------------------------------------------------------
+
+# Initialize wallet directory structure
+init_wallet_dir() {
+    mkdir -p "$WALLET_DIR"
+    touch "$WALLET_LIST"
+    chmod 700 "$WALLET_DIR"
+}
+
+# Encrypt mnemonic
+encrypt_mnemonic() {
+    local wallet_name="$1"
+    local mnemonic="$2"
+    local password="$3"
     
-    local user=$(get_input "SSH Connection" "SSH username (same for all):")
-    [[ -z "$user" ]] && { show_msg "Cancelled" "Operation cancelled."; return; }
+    local wallet_enc="$WALLET_DIR/${wallet_name}.enc"
+    echo "$mnemonic" | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -out "$wallet_enc" -pass pass:"$password"
+    chmod 600 "$wallet_enc"
     
-    local pass=$(get_password "SSH Connection" "SSH password for $user:")
-    [[ -z "$pass" ]] && { show_msg "Cancelled" "Operation cancelled."; return; }
-    
-    local command=$(dialog --title "SSH Command" --inputbox "Enter command to execute on selected nodes:\n(Multi-line commands supported)" 12 70 3>&1 1>&2 2>&3)
-    [[ $? -ne 0 || -z "$command" ]] && { show_msg "Cancelled" "Operation cancelled."; return; }
-    
-    local use_root="false"
-    if dialog --title "Root Execution" --yesno "Execute command with sudo/root privileges?\n\nCommand: $command\n\nSelect 'Yes' for root execution\nSelect 'No' for normal user execution" 12 60; then
-        use_root="true"
+    if [ ! -f "$WALLET_LIST" ]; then
+        touch "$WALLET_LIST"
+        chmod 600 "$WALLET_LIST"
     fi
     
-    local node_list=""
-    for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
-        node_list+="\n• ${SELECTED_NODES_NAMES[i]} (${SELECTED_NODES_IPS[i]})"
+    if ! grep -q "^${wallet_name}$" "$WALLET_LIST" 2>/dev/null; then
+        echo "$wallet_name" >> "$WALLET_LIST"
+    fi
+    
+    log "WALLET" "Wallet '$wallet_name' encrypted and saved"
+}
+
+# Decrypt mnemonic
+decrypt_mnemonic() {
+    local wallet_name="$1"
+    local password="$2"
+    local wallet_enc="$WALLET_DIR/${wallet_name}.enc"
+    
+    if [ ! -f "$wallet_enc" ]; then
+        return 1
+    fi
+    
+    mnemonic=$(openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -in "$wallet_enc" -pass pass:"$password" 2>/dev/null)
+    
+    if [ $? -ne 0 ] || [ -z "$mnemonic" ]; then
+        return 1
+    fi
+    
+    echo "$mnemonic"
+}
+
+# Check if nym-cli is installed
+check_nym_cli() {
+    if ! command -v nym-cli &> /dev/null; then
+        show_error "nym-cli not found in PATH\n\nPlease install nym-cli or add it to your PATH"
+        return 1
+    fi
+    return 0
+}
+
+# Derive Nyx address from mnemonic
+derive_address_from_mnemonic() {
+    local mnemonic="$1"
+    local address=""
+    
+    if ! check_nym_cli; then
+        return 1
+    fi
+    
+    # Try to get address using nym-cli
+    local account_output=$(nym-cli account pub-key --mnemonic "$mnemonic" 2>&1)
+    
+    # Try multiple extraction patterns
+    address=$(echo "$account_output" | sed -n 's/.*\(n1[0-9a-z]\{38,\}\).*/\1/p' | head -1)
+    
+    if [ -z "$address" ]; then
+        address=$(echo "$account_output" | grep -Eo 'n1[0-9a-z]{38,}' | head -1)
+    fi
+    
+    if [ -z "$address" ]; then
+        address=$(echo "$account_output" | awk '/n1[0-9a-z]/ {for(i=1;i<=NF;i++) if($i ~ /^n1[0-9a-z]{38,}/) print $i}' | head -1)
+    fi
+    
+    echo "$address"
+}
+
+# Query pending operator rewards from REST API
+query_pending_rewards() {
+    local address="$1"
+    local wallet_name="$2"
+    
+    # Create base64 encoded query
+    local query_json="{\"get_pending_operator_reward\":{\"address\":\"$address\"}}"
+    local query_b64=$(echo -n "$query_json" | base64 -w 0 2>/dev/null || echo -n "$query_json" | base64)
+    
+    # Mixnet contract and REST API endpoint
+    local contract="n17srjznxl9dvzdkpwpw24gg668wc73val88a6m5ajg6ankwvz9wtst0cznr"
+    local url="https://rest.cosmos.directory/nyx/cosmwasm/wasm/v1/contract/${contract}/smart/${query_b64}"
+    
+    # Query the API
+    local response=$(curl -s "$url" 2>&1)
+    local curl_exit=$?
+    
+    if [ $curl_exit -ne 0 ]; then
+        echo "ERROR|Network error: Failed to connect to API"
+        return 1
+    fi
+    
+    # Check for API errors
+    if echo "$response" | jq -e '.code' &>/dev/null 2>&1; then
+        local error_msg=$(echo "$response" | jq -r '.message // "Unknown error"' 2>/dev/null)
+        echo "ERROR|API error: $error_msg"
+        return 1
+    fi
+    
+    # Extract the amount_earned.amount from the response
+    local amount_unym=$(echo "$response" | jq -r '.data.amount_earned.amount' 2>/dev/null)
+    
+    if [ -z "$amount_unym" ] || [ "$amount_unym" == "null" ]; then
+        # Check if it's an empty response or error
+        if echo "$response" | grep -qi "error\|not found"; then
+            echo "NONE|No operator rewards found (no node bonded or no rewards available)"
+        else
+            echo "NONE|No pending rewards"
+        fi
+        return 0
+    fi
+    
+    if [ "$amount_unym" == "0" ]; then
+        echo "NONE|No pending rewards (0 uNYM)"
+        return 0
+    fi
+    
+    # Convert uNYM to NYM (divide by 1,000,000)
+    local amount_nym=$(echo "scale=6; $amount_unym / 1000000" | bc 2>/dev/null)
+    
+    if [ -z "$amount_nym" ]; then
+        amount_nym="N/A"
+    fi
+    
+    echo "SUCCESS|$amount_unym|$amount_nym"
+    return 0
+}
+
+# Get wallet balance using nym-cli
+get_wallet_balance() {
+    local address="$1"
+    
+    if ! check_nym_cli; then
+        echo "ERROR"
+        return 1
+    fi
+    
+    # Query balance using nym-cli
+    local balance_output=$(nym-cli account balance "$address" 2>&1)
+    
+    # Extract the balance from the last line (format: "144.974769 nym")
+    local balance=$(echo "$balance_output" | tail -1 | grep -Eo '[0-9]+\.[0-9]+ nym' | awk '{print $1}')
+    
+    if [ -z "$balance" ]; then
+        # Try alternate format without decimal
+        balance=$(echo "$balance_output" | tail -1 | grep -Eo '[0-9]+ nym' | awk '{print $1}')
+    fi
+    
+    if [ -z "$balance" ]; then
+        echo "0"
+    else
+        echo "$balance"
+    fi
+    return 0
+}
+
+# Validate Nym address format
+validate_nym_address() {
+    local address="$1"
+    
+    # Nym addresses start with 'n1' or 'n' followed by 38-50 alphanumeric characters
+    if [[ "$address" =~ ^n1[a-z0-9]{38,50}$ ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Get list of wallets sorted alphabetically
+get_wallet_list() {
+    if [[ ! -f "$WALLET_LIST" ]] || [[ ! -s "$WALLET_LIST" ]]; then
+        return 1
+    fi
+    # Sort wallet names alphabetically
+    sort "$WALLET_LIST"
+    return 0
+}
+
+# Add a new wallet
+wallet_add() {
+    local wallet_name=$(get_input "Add Wallet" "Enter wallet name:")
+    [[ -z "$wallet_name" ]] && return
+    
+    # Check if wallet already exists
+    if get_wallet_list | grep -q "^${wallet_name}$"; then
+        show_error "Wallet '$wallet_name' already exists!"
+        return
+    fi
+    
+    local mnemonic=$(get_input "Add Wallet" "Enter 24-word mnemonic phrase:")
+    [[ -z "$mnemonic" ]] && return
+    
+    # Validate mnemonic word count
+    local word_count=$(echo "$mnemonic" | wc -w)
+    if [[ $word_count -ne 24 ]]; then
+        show_error "Invalid mnemonic! Must be exactly 24 words. You provided $word_count words."
+        return
+    fi
+    
+    local password=$(get_password "Add Wallet" "Enter encryption password:")
+    [[ -z "$password" ]] && return
+    
+    local password_confirm=$(get_password "Add Wallet" "Confirm encryption password:")
+    [[ -z "$password_confirm" ]] && return
+    
+    if [[ "$password" != "$password_confirm" ]]; then
+        show_error "Passwords do not match!"
+        return
+    fi
+    
+    # Encrypt and save mnemonic using the v61 function
+    encrypt_mnemonic "$wallet_name" "$mnemonic" "$password"
+    
+    log "WALLET" "Added wallet: $wallet_name"
+    show_success "Wallet '$wallet_name' added successfully!"
+}
+
+# List all wallets
+wallet_list() {
+    init_wallet_dir
+    
+    local wallets
+    if ! wallets=$(get_wallet_list); then
+        show_msg "No Wallets" "No wallets found.\n\nUse 'Add new wallet' to create one."
+        return
+    fi
+    
+    # Ask for password once to decrypt and show addresses
+    local password=$(get_password "List Wallets" "Enter password to display wallet information:")
+    [[ -z "$password" ]] && return
+    
+    # Show loading message
+    dialog --title "Loading Wallets" --infobox "Querying wallet information...\nThis may take a moment." 5 50
+    
+    local wallet_list="Saved Wallets:\n════════════════════════════════════════════════════════════════════════════════════════════════\n\n"
+    local count=0
+    local success_count=0
+    local fail_count=0
+    
+    while IFS= read -r wallet_name; do
+        ((count++))
+        
+        # Try to decrypt and derive address
+        local mnemonic=$(decrypt_mnemonic "$wallet_name" "$password" 2>/dev/null)
+        
+        if [ $? -ne 0 ] || [ -z "$mnemonic" ]; then
+            wallet_list+="$wallet_name\n"
+            wallet_list+="  Status: Failed to decrypt (wrong password)\n\n"
+            ((fail_count++))
+            continue
+        fi
+        
+        # Derive address using the same function as other menus
+        local address=$(derive_address_from_mnemonic "$mnemonic")
+        
+        if [ -z "$address" ]; then
+            wallet_list+="$wallet_name\n"
+            wallet_list+="  Status: Failed to derive address\n\n"
+            ((fail_count++))
+            continue
+        fi
+        
+        # Query balance using the same function as "Create new transaction"
+        local balance=$(get_wallet_balance "$address")
+        if [ -z "$balance" ] || [ "$balance" == "ERROR" ]; then
+            balance="0"
+        fi
+        
+        # Query operator rewards using the same function as "Query available rewards"
+        local rewards_result=$(query_pending_rewards "$address" "$wallet_name")
+        local rewards_status=$(echo "$rewards_result" | cut -d'|' -f1)
+        local rewards_nym="0"
+        local rewards_unym="0"
+        
+        if [ "$rewards_status" == "SUCCESS" ]; then
+            rewards_unym=$(echo "$rewards_result" | cut -d'|' -f2)
+            rewards_nym=$(echo "$rewards_result" | cut -d'|' -f3)
+        elif [ "$rewards_status" == "NONE" ]; then
+            rewards_nym="0"
+            rewards_unym="0"
+        else
+            # ERROR case
+            rewards_nym="Error"
+            rewards_unym="Error"
+        fi
+        
+        # Format output
+        wallet_list+="$wallet_name\n"
+        wallet_list+="  Address: $address\n"
+        wallet_list+="  Claimable operator rewards: $rewards_nym NYM\n"
+        wallet_list+="  Wallet balance: $balance NYM\n\n"
+        
+        ((success_count++))
+    done <<< "$wallets"
+    
+    wallet_list+="════════════════════════════════════════════════════════════════════════════════════════════════\n"
+    wallet_list+="Total: $count | Successfully displayed: $success_count | Failed: $fail_count"
+    
+    dialog --title "Wallet List" --msgbox "$wallet_list" 35 100
+}
+
+# Export wallet (show mnemonic)
+wallet_export() {
+    local wallets
+    if ! wallets=$(get_wallet_list); then
+        show_msg "No Wallets" "No wallets configured. Add a wallet first!"
+        return
+    fi
+    
+    # Create menu options from sorted wallet list
+    local options=()
+    local count=0
+    while IFS= read -r wallet; do
+        ((count++))
+        options+=("$count" "$wallet")
+    done <<< "$wallets"
+    
+    local choice=$(dialog --clear --title "Export Wallet" --menu "Select wallet to export:" 15 60 "${#options[@]}" "${options[@]}" 3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && return
+    
+    # Get wallet name from sorted list
+    local wallet_name=$(echo "$wallets" | sed -n "${choice}p")
+    [[ -z "$wallet_name" ]] && return
+    
+    local password=$(get_password "Export Wallet" "Enter encryption password for '$wallet_name':")
+    [[ -z "$password" ]] && return
+    
+    local mnemonic=$(decrypt_mnemonic "$wallet_name" "$password")
+    
+    if [[ $? -ne 0 ]] || [[ -z "$mnemonic" ]]; then
+        show_error "Decryption failed! Incorrect password."
+        return
+    fi
+    
+    dialog --title "Wallet Mnemonic" --msgbox "Wallet: $wallet_name\n\nMnemonic Phrase:\n────────────────────────────────────────────────────────\n$mnemonic\n────────────────────────────────────────────────────────\n\nWARNING: Keep this safe! Anyone with this phrase can access your funds." 20 80
+    
+    log "WALLET" "Exported wallet: $wallet_name"
+}
+
+# Delete wallet
+wallet_delete() {
+    local wallets
+    if ! wallets=$(get_wallet_list); then
+        show_msg "No Wallets" "No wallets configured. Add a wallet first!"
+        return
+    fi
+    
+    # Add "All Wallets" option at the beginning
+    local checklist=("0" "🌟 All Wallets" "off")
+    local count=0
+    while IFS= read -r wallet; do
+        ((count++))
+        checklist+=("$count" "$wallet" "off")
+    done <<< "$wallets"
+    
+    local choices=$(dialog --clear --title "Delete Wallet" --separate-output --checklist "Select wallets to delete (Space=toggle, Enter=confirm):" 18 60 "${#checklist[@]}" "${checklist[@]}" 3>&1 1>&2 2>&3)
+    [[ $? -ne 0 || -z "$choices" ]] && return
+    
+    # Check if "All Wallets" was selected
+    local delete_all=false
+    if echo "$choices" | grep -q "^0$"; then
+        delete_all=true
+    fi
+    
+    # Collect selected wallets
+    local selected_wallets=()
+    if [[ "$delete_all" == "true" ]]; then
+        # Add all wallets
+        while IFS= read -r wallet; do
+            selected_wallets+=("$wallet")
+        done <<< "$wallets"
+    else
+        # Add only selected wallets
+        while IFS= read -r choice; do
+            [[ "$choice" == "0" ]] && continue  # Skip "All Wallets" option
+            local wallet_name=$(echo "$wallets" | sed -n "${choice}p")
+            selected_wallets+=("$wallet_name")
+        done <<< "$choices"
+    fi
+    
+    [[ ${#selected_wallets[@]} -eq 0 ]] && return
+    
+    # Build confirmation message
+    local confirm_msg="Delete ${#selected_wallets[@]} wallet(s)?\n\n"
+    for wallet in "${selected_wallets[@]}"; do
+        confirm_msg+="• $wallet\n"
+    done
+    confirm_msg+="\nWARNING: This action cannot be undone!\nMake sure you have backed up all mnemonics."
+    
+    confirm "$confirm_msg" || return
+    
+    # Delete selected wallets
+    local deleted=0
+    for wallet_name in "${selected_wallets[@]}"; do
+        local wallet_file="$WALLET_DIR/${wallet_name}.enc"
+        rm -f "$wallet_file"
+        
+        # Remove from wallet list
+        local temp=$(mktemp)
+        grep -v "^${wallet_name}$" "$WALLET_LIST" > "$temp"
+        mv "$temp" "$WALLET_LIST"
+        
+        log "WALLET" "Deleted wallet: $wallet_name"
+        ((deleted++))
     done
     
-    local exec_mode=$([[ "$use_root" == "true" ]] && echo "as ROOT" || echo "as USER")
-    confirm "Execute command on ${#SELECTED_NODES_NAMES[@]} node(s) $exec_mode?$node_list\n\nCommand:\n$command" || return
+    show_success "$deleted wallet(s) deleted successfully!"
+}
+
+# Derive Nyx address from mnemonic using nym-cli
+derive_nyx_address() {
+    local mnemonic="$1"
     
-    local successful=() failed=()
-    local total=${#SELECTED_NODES_NAMES[@]} current=0
+    # Check if nym-cli is available
+    if ! command -v nym-cli >/dev/null 2>&1; then
+        echo "ERROR: nym-cli not found"
+        return 1
+    fi
     
-    for ((i=0; i<total; i++)); do
-        local name="${SELECTED_NODES_NAMES[i]}" ip="${SELECTED_NODES_IPS[i]}"
+    # Create temporary file for mnemonic (security: only in memory/temp, immediately deleted)
+    local temp_mnemonic=$(mktemp)
+    echo "$mnemonic" > "$temp_mnemonic"
+    
+    # Use nym-cli to derive address (using account 0, typically operator account)
+    local address=$(nym-cli --mnemonic-file "$temp_mnemonic" account show 2>/dev/null | grep "Address:" | awk '{print $2}')
+    
+    # Clean up temp file immediately
+    shred -u "$temp_mnemonic" 2>/dev/null || rm -f "$temp_mnemonic"
+    
+    if [[ -z "$address" ]]; then
+        echo "ERROR: Failed to derive address"
+        return 1
+    fi
+    
+    echo "$address"
+    return 0
+}
+
+# Withdraw operator rewards from selected wallets
+wallet_withdraw_rewards() {
+    if ! check_nym_cli; then
+        return
+    fi
+    
+    init_wallet_dir
+    
+    local wallets
+    if ! wallets=$(get_wallet_list); then
+        show_msg "No Wallets" "No wallets configured. Add a wallet first!"
+        return
+    fi
+    
+    # Create checklist options from sorted wallet list
+    local checklist=()
+    local count=0
+    while IFS= read -r wallet; do
+        ((count++))
+        checklist+=("$count" "$wallet" "off")
+    done <<< "$wallets"
+    
+    local choices=$(dialog --clear --title "Withdraw Rewards" --separate-output --checklist "Select wallets (Space=toggle, Enter=confirm):" 18 60 "${#checklist[@]}" "${checklist[@]}" 3>&1 1>&2 2>&3)
+    [[ $? -ne 0 || -z "$choices" ]] && return
+    
+    # Collect selected wallets in order
+    local selected_wallets=()
+    while IFS= read -r choice; do
+        local wallet_name=$(echo "$wallets" | sed -n "${choice}p")
+        selected_wallets+=("$wallet_name")
+    done <<< "$choices"
+    
+    [[ ${#selected_wallets[@]} -eq 0 ]] && return
+    
+    # Warning confirmation
+    if ! confirm "WARNING: This will WITHDRAW rewards!\n\nThe rewards will be withdrawn to your account.\n\nProceed with withdrawal for ${#selected_wallets[@]} wallet(s)?"; then
+        show_msg "Cancelled" "Rewards withdrawal cancelled."
+        return
+    fi
+    
+    # Ask for password strategy
+    local use_same_password=true
+    if [ ${#selected_wallets[@]} -gt 1 ]; then
+        if ! confirm "Use the same password for all selected wallets?\n\n(Select 'No' to enter password for each wallet individually)"; then
+            use_same_password=false
+        fi
+    fi
+    
+    local password=""
+    if [ "$use_same_password" == "true" ]; then
+        password=$(get_password "Withdraw Rewards" "Enter decryption password:")
+        [[ -z "$password" ]] && return
+    fi
+    
+    # Process withdrawals
+    local results="Withdrawal Results\n────────────────────────────────────────────────────────\n\n"
+    local success=0 failed=0
+    local total=${#selected_wallets[@]}
+    local current=0
+    
+    for wallet_name in "${selected_wallets[@]}"; do
         ((current++))
         
-        dialog --title "Executing Command" --infobox "Processing $name ($current/$total)...\nExecuting command..." 6 60
+        dialog --title "Processing" --infobox "Withdrawing rewards ($current/$total)\n$wallet_name..." 6 50
         
-        ssh_exec "$ip" "$user" "$pass" "$command" "Custom Command" "$use_root" >/dev/null 2>&1
-        local exec_result=$?
+        # Get password for this wallet if needed
+        local wallet_password="$password"
+        if [ "$use_same_password" == "false" ]; then
+            wallet_password=$(get_password "Withdraw Rewards" "Enter password for '$wallet_name':")
+            [[ -z "$wallet_password" ]] && { results+="$wallet_name: Skipped (no password)\n\n"; ((failed++)); continue; }
+        fi
         
-        if [[ $exec_result -eq 0 ]]; then
-            successful+=("$name")
+        local mnemonic=$(decrypt_mnemonic "$wallet_name" "$wallet_password")
+        
+        if [[ $? -ne 0 ]] || [[ -z "$mnemonic" ]]; then
+            results+="$wallet_name - Decryption failed (wrong password?)\n\n"
+            ((failed++))
+            continue
+        fi
+        
+        # Get address for display
+        local address=$(derive_address_from_mnemonic "$mnemonic")
+        
+        # Execute withdrawal using nym-cli
+        local withdraw_output=$(nym-cli mixnet operators nymnode rewards claim --mnemonic "$mnemonic" 2>&1)
+        local withdraw_status=$?
+        
+        if [[ $withdraw_status -eq 0 ]]; then
+            results+="SUCCESS: $wallet_name"
+            [[ -n "$address" ]] && results+=" (${address:0:15}...)"
+            results+="\n   Withdrawal initiated successfully\n\n"
+            ((success++))
         else
-            failed+=("$name")
+            results+="FAILED: $wallet_name"
+            [[ -n "$address" ]] && results+=" (${address:0:15}...)"
+            results+="\n   Error: $withdraw_output\n\n"
+            ((failed++))
         fi
     done
     
-    local info="Command: $command\nExecution Mode: $exec_mode"
-    show_operation_results "⚡ SSH Command Execution" successful failed "$info"
+    results+="Summary: $success succeeded, $failed failed"
+    dialog --title "Withdrawal Results" --msgbox "$results" 25 80
+    
+    log "WALLET" "Withdrawal operation: $success succeeded, $failed failed"
+}
+
+# Query available rewards for selected wallets
+wallet_query_rewards() {
+    if ! check_nym_cli; then
+        return
+    fi
+    
+    init_wallet_dir
+    
+    local wallets
+    if ! wallets=$(get_wallet_list); then
+        show_msg "No Wallets" "No wallets configured. Add a wallet first!"
+        return
+    fi
+    
+    # Create checklist with "Select All" option
+    local checklist=("0" "🌟 Select All Wallets" "off")
+    local count=0
+    while IFS= read -r wallet; do
+        ((count++))
+        checklist+=("$count" "$wallet" "off")
+    done <<< "$wallets"
+    
+    local choices=$(dialog --clear --title "Query Rewards" --separate-output --checklist "Select wallets to query (Space=toggle, Enter=confirm):" 18 60 "${#checklist[@]}" "${checklist[@]}" 3>&1 1>&2 2>&3)
+    [[ $? -ne 0 || -z "$choices" ]] && return
+    
+    # Collect selected wallets
+    local selected_wallets=()
+    local select_all=false
+    
+    while IFS= read -r choice; do
+        if [[ "$choice" == "0" ]]; then
+            select_all=true
+        else
+            local wallet_name=$(echo "$wallets" | sed -n "${choice}p")
+            selected_wallets+=("$wallet_name")
+        fi
+    done <<< "$choices"
+    
+    # If "Select All" was chosen, add all wallets
+    if [ "$select_all" == "true" ]; then
+        selected_wallets=()
+        while IFS= read -r wallet_name; do
+            selected_wallets+=("$wallet_name")
+        done <<< "$wallets"
+    fi
+    
+    if [ ${#selected_wallets[@]} -eq 0 ]; then
+        show_msg "No Selection" "No wallets selected."
+        return
+    fi
+    
+    # Ask for password once (assuming same password for all, or ask per wallet)
+    local use_same_password=true
+    if [ ${#selected_wallets[@]} -gt 1 ]; then
+        if ! confirm "Use the same password for all selected wallets?\n\n(Select 'No' to enter password for each wallet individually)"; then
+            use_same_password=false
+        fi
+    fi
+    
+    local password=""
+    if [ "$use_same_password" == "true" ]; then
+        password=$(get_password "Query Rewards" "Enter decryption password:")
+        [[ -z "$password" ]] && return
+    fi
+    
+    # Process each wallet
+    local results=""
+    local total=${#selected_wallets[@]}
+    local current=0
+    local success_count=0
+    local fail_count=0
+    local total_rewards_nym=0
+    
+    for wallet_name in "${selected_wallets[@]}"; do
+        ((current++))
+        
+        dialog --title "Query Rewards" --infobox "Processing wallet $current/$total\n$wallet_name\n\nDecrypting..." 7 50
+        
+        # Get password for this wallet if needed
+        local wallet_password="$password"
+        if [ "$use_same_password" == "false" ]; then
+            wallet_password=$(get_password "Query Rewards" "Enter password for '$wallet_name':")
+            [[ -z "$wallet_password" ]] && { results+="$wallet_name: Skipped (no password)\n"; ((fail_count++)); continue; }
+        fi
+        
+        # Decrypt mnemonic
+        local mnemonic=$(decrypt_mnemonic "$wallet_name" "$wallet_password" 2>/dev/null)
+        
+        if [ $? -ne 0 ] || [ -z "$mnemonic" ]; then
+            results+="❌ $wallet_name: Failed to decrypt (wrong password?)\n"
+            ((fail_count++))
+            continue
+        fi
+        
+        dialog --title "Query Rewards" --infobox "Processing wallet $current/$total\n$wallet_name\n\nDeriving address..." 7 50
+        
+        # Derive address
+        local address=$(derive_address_from_mnemonic "$mnemonic")
+        
+        if [ -z "$address" ]; then
+            results+="❌ $wallet_name: Failed to derive address\n"
+            ((fail_count++))
+            continue
+        fi
+        
+        dialog --title "Query Rewards" --infobox "Processing wallet $current/$total\n$wallet_name\n\nQuerying rewards..." 7 50
+        
+        # Query rewards
+        local query_result=$(query_pending_rewards "$address" "$wallet_name")
+        local query_status=$(echo "$query_result" | cut -d'|' -f1)
+        local query_message=$(echo "$query_result" | cut -d'|' -f2-)
+        
+        case "$query_status" in
+            "SUCCESS")
+                local unym=$(echo "$query_message" | cut -d'|' -f1)
+                local nym=$(echo "$query_message" | cut -d'|' -f2)
+                results+="$wallet_name\n"
+                results+="   Address: ${address:0:20}...${address: -10}\n"
+                results+="   Rewards: $nym NYM ($unym uNYM)\n\n"
+                # Add to total rewards
+                total_rewards_nym=$(echo "$total_rewards_nym + $nym" | bc 2>/dev/null)
+                ((success_count++))
+                ;;
+            "NONE")
+                results+="$wallet_name\n"
+                results+="   Address: ${address:0:20}...${address: -10}\n"
+                results+="   Status: $query_message\n\n"
+                ((success_count++))
+                ;;
+            "ERROR")
+                results+="$wallet_name: $query_message\n\n"
+                ((fail_count++))
+                ;;
+            *)
+                results+="$wallet_name: Unknown error\n\n"
+                ((fail_count++))
+                ;;
+        esac
+    done
+    
+    # Display results
+    local header="Pending Operator Rewards Query Results\n"
+    header+="════════════════════════════════════════════════════\n"
+    header+="Processed: $total wallet(s)\n"
+    header+="Successful: $success_count | Failed: $fail_count\n"
+    header+="Combined rewards: $total_rewards_nym NYM\n"
+    header+="════════════════════════════════════════════════════\n\n"
+    
+    dialog --title "Query Results" --msgbox "${header}${results}\n\n💡 Tip: Use 'Withdraw operator rewards' to claim" 30 80
+}
+
+# Create new transaction
+wallet_create_transaction() {
+    if ! check_nym_cli; then
+        return
+    fi
+    
+    init_wallet_dir
+    
+    local wallets
+    if ! wallets=$(get_wallet_list); then
+        show_msg "No Wallets" "No wallets configured. Add a wallet first!"
+        return
+    fi
+    
+    # Ask for password to decrypt wallets
+    local password=$(get_password "Create Transaction" "Enter password to decrypt wallets and query balances:")
+    [[ -z "$password" ]] && return
+    
+    # Query balances for all wallets
+    dialog --title "Loading" --infobox "Querying wallet balances...\nThis may take a moment..." 5 50
+    
+    local wallet_data=()
+    local wallet_addresses=()
+    local wallet_balances=()
+    local wallet_names_array=()
+    
+    while IFS= read -r wallet_name; do
+        # Decrypt wallet
+        local mnemonic=$(decrypt_mnemonic "$wallet_name" "$password" 2>/dev/null)
+        
+        if [ $? -ne 0 ] || [ -z "$mnemonic" ]; then
+            wallet_data+=("$wallet_name|ERROR|Wrong password")
+            continue
+        fi
+        
+        # Derive address
+        local address=$(derive_address_from_mnemonic "$mnemonic")
+        
+        if [ -z "$address" ]; then
+            wallet_data+=("$wallet_name|ERROR|Failed to derive address")
+            continue
+        fi
+        
+        # Get balance
+        local balance=$(get_wallet_balance "$address")
+        
+        wallet_data+=("$wallet_name|$address|$balance")
+        wallet_addresses+=("$address")
+        wallet_balances+=("$balance")
+        wallet_names_array+=("$wallet_name")
+    done <<< "$wallets"
+    
+    # Display wallet list with balances
+    local wallet_list="Wallet Balances:\n════════════════════════════════════════════════════════\n\n"
+    local checklist=("0" "Select All Wallets" "off")
+    local count=0
+    
+    for data in "${wallet_data[@]}"; do
+        ((count++))
+        local name=$(echo "$data" | cut -d'|' -f1)
+        local addr=$(echo "$data" | cut -d'|' -f2)
+        local bal=$(echo "$data" | cut -d'|' -f3)
+        
+        if [[ "$addr" == "ERROR" ]]; then
+            wallet_list+="$count. $name\n    WARNING: $bal\n\n"
+        else
+            wallet_list+="$count. $name\n    ${addr:0:20}...${addr: -10}\n    Balance: $bal NYM\n\n"
+            checklist+=("$count" "$name ($bal NYM)" "off")
+        fi
+    done
+    
+    # Show wallet list first
+    dialog --title "Wallet Balances" --msgbox "$wallet_list" 25 70
+    
+    # Select wallets for transaction
+    local choices=$(dialog --clear --title "Select Wallets" --separate-output --checklist "Select wallets to send from (Space=toggle, Enter=confirm):" 20 70 "${#checklist[@]}" "${checklist[@]}" 3>&1 1>&2 2>&3)
+    [[ $? -ne 0 || -z "$choices" ]] && return
+    
+    # Collect selected wallets
+    local selected_wallets=()
+    local select_all=false
+    
+    while IFS= read -r choice; do
+        if [[ "$choice" == "0" ]]; then
+            select_all=true
+        else
+            local idx=$((choice - 1))
+            selected_wallets+=("$idx")
+        fi
+    done <<< "$choices"
+    
+    # If "Select All" was chosen, add all valid wallets
+    if [ "$select_all" == "true" ]; then
+        selected_wallets=()
+        for i in "${!wallet_names_array[@]}"; do
+            selected_wallets+=("$i")
+        done
+    fi
+    
+    if [ ${#selected_wallets[@]} -eq 0 ]; then
+        show_msg "No Selection" "No wallets selected."
+        return
+    fi
+    
+    # Get receiver address with validation
+    local receiver_address=""
+    while true; do
+        receiver_address=$(get_input "Receiver Address" "Enter the receiver Nym address (n1...):")
+        [[ -z "$receiver_address" ]] && return
+        
+        if validate_nym_address "$receiver_address"; then
+            break
+        else
+            show_error "Invalid Nym address format!\n\nAddress must start with 'n1' followed by 38-50 characters.\n\nExample: n1abc123...xyz789"
+        fi
+    done
+    
+    # Calculate total amount and prepare transaction summary
+    local total_nym=0
+    local tx_summary="Transaction Summary:\n════════════════════════════════════════════════════════\n\n"
+    tx_summary+="Receiver: $receiver_address\n\n"
+    tx_summary+="Sending from:\n"
+    
+    local tx_wallets=()
+    local tx_amounts_nym=()
+    
+    for idx in "${selected_wallets[@]}"; do
+        local wallet_name="${wallet_names_array[$idx]}"
+        local balance="${wallet_balances[$idx]}"
+        
+        # Convert balance to integer (remove decimal part)
+        local amount_nym=$(echo "$balance" | cut -d'.' -f1)
+        
+        # Skip if balance is 0 or empty
+        if [ -z "$amount_nym" ] || [ "$amount_nym" == "0" ]; then
+            tx_summary+="  WARNING: $wallet_name - Skipped (balance: $balance NYM)\n"
+            continue
+        fi
+        
+        tx_wallets+=("$wallet_name")
+        tx_amounts_nym+=("$amount_nym")
+        
+        total_nym=$((total_nym + amount_nym))
+        tx_summary+="  • $wallet_name: $amount_nym NYM\n"
+    done
+    
+    tx_summary+="\n────────────────────────────────────────────────────────\n"
+    tx_summary+="Total to send: $total_nym NYM\n"
+    tx_summary+="════════════════════════════════════════════════════════\n\n"
+    tx_summary+="WARNING: This will send the MAXIMUM available balance\n"
+    tx_summary+="(excluding decimal amounts) from each selected wallet!"
+    
+    # Show confirmation
+    if ! dialog --title "Confirm Transaction" --yesno "$tx_summary" 25 70; then
+        show_msg "Cancelled" "Transaction cancelled."
+        return
+    fi
+    
+    # Execute transactions
+    local results="Transaction Results:\n════════════════════════════════════════════════════════\n\n"
+    local success=0
+    local failed=0
+    local total_sent=0
+    local total_txs=${#tx_wallets[@]}
+    
+    for i in "${!tx_wallets[@]}"; do
+        local wallet_name="${tx_wallets[$i]}"
+        local amount_nym="${tx_amounts_nym[$i]}"
+        local amount_unym=$((amount_nym * 1000000))
+        
+        dialog --title "Processing" --infobox "Sending transaction $((i+1))/$total_txs\n$wallet_name: $amount_nym NYM..." 6 50
+        
+        # Decrypt wallet
+        local mnemonic=$(decrypt_mnemonic "$wallet_name" "$password" 2>/dev/null)
+        
+        if [ $? -ne 0 ] || [ -z "$mnemonic" ]; then
+            results+="FAILED: $wallet_name\n"
+            results+="   Error: Failed to decrypt wallet\n\n"
+            ((failed++))
+            continue
+        fi
+        
+        # Execute transaction
+        local tx_output=$(nym-cli account send "$receiver_address" "$amount_unym" --mnemonic "$mnemonic" 2>&1)
+        local tx_status=$?
+        
+        if [[ $tx_status -eq 0 ]]; then
+            results+="SUCCESS: $wallet_name\n"
+            results+="   Sent: $amount_nym NYM ($amount_unym uNYM)\n"
+            results+="   Status: Success\n\n"
+            ((success++))
+            total_sent=$((total_sent + amount_nym))
+        else
+            results+="FAILED: $wallet_name\n"
+            results+="   Amount: $amount_nym NYM ($amount_unym uNYM)\n"
+            results+="   Error: $tx_output\n\n"
+            ((failed++))
+        fi
+    done
+    
+    results+="════════════════════════════════════════════════════════\n"
+    results+="Summary: $success succeeded | $failed failed\n"
+    results+="Total sent: $total_sent NYM"
+    
+    dialog --title "Transaction Complete" --msgbox "$results" 30 80
+    
+    log "WALLET" "Transaction operation: $success succeeded, $failed failed, total sent: $total_sent NYM"
+}
+
+# Wallet operations menu
+wallet_operations_menu() {
+    init_wallet_dir
+    
+    while true; do
+        local choice=$(dialog --clear --title "Wallet Operations" --menu "Manage your Nym wallets:" 18 65 7 \
+            1 "Add new wallet" \
+            2 "List wallets" \
+            3 "Withdraw operator rewards" \
+            4 "Create new transaction" \
+            5 "Export wallet (show mnemonic)" \
+            6 "Delete wallet" \
+            0 "Back to Main Menu" 3>&1 1>&2 2>&3)
+        
+        [[ $? -ne 0 ]] && break
+        
+        case $choice in
+            1) wallet_add ;;
+            2) wallet_list ;;
+            3) wallet_withdraw_rewards ;;
+            4) wallet_create_transaction ;;
+            5) wallet_export ;;
+            6) wallet_delete ;;
+            0) break ;;
+        esac
+    done
 }
 
 # ----------------------------------------------------------------------------
@@ -1126,12 +1687,20 @@ diagnostics_menu() {
 
 main_menu() {
     while true; do
-        local choice=$(dialog --clear --title "$SCRIPT_NAME v$VERSION" --menu "Select category:" 16 60 5 \
-            1 "Node Management" 2 "Node Operations" 3 "Configuration" 4 "Diagnostics" 0 "Exit" 3>&1 1>&2 2>&3)
+        local choice=$(dialog --clear --title "$SCRIPT_NAME v$VERSION" --menu "Select category:" 18 60 6 \
+            1 "Node Management" \
+            2 "Node Operations" \
+            3 "Wallet Operations" \
+            4 "Configuration" \
+            5 "Diagnostics" \
+            0 "Exit" 3>&1 1>&2 2>&3)
         [[ $? -ne 0 ]] && break
         case $choice in
-            1) node_management_menu ;; 2) node_operations_menu ;; 
-            3) config_menu ;; 4) diagnostics_menu ;; 
+            1) node_management_menu ;; 
+            2) node_operations_menu ;; 
+            3) wallet_operations_menu ;;
+            4) config_menu ;; 
+            5) diagnostics_menu ;; 
             0) confirm "Exit?" && break ;;
         esac
     done
