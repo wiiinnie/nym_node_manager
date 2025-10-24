@@ -2,6 +2,8 @@
 
 A comprehensive terminal-based management tool for Nym network nodes with built-in wallet operations.
 
+<img width="449" height="280" alt="Screenshot 2025-10-24 at 12 03 26" src="https://github.com/user-attachments/assets/8a94b93a-b4a2-47a4-a91b-c1c81a662463" />
+
 ## 📖 Overview
 
 Nym Node Manager is a powerful bash-based tool that simplifies the management of Nym network nodes and cryptocurrency wallets. With an intuitive dialog-based interface, it provides centralized control over multiple nodes, secure wallet management, and automated operations.
