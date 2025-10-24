@@ -1,468 +1,409 @@
 # Nym Node Manager
 
-A comprehensive bash script for managing multiple Nym network nodes with an intuitive dialog-based interface. Streamline your Nym node operations with batch processing, persistent configuration, and detailed monitoring capabilities.
+A comprehensive terminal-based management tool for Nym network nodes with built-in wallet operations.
 
-## 🚀 Features
+## 📖 Overview
 
-### Core Node Management
-- **📋 Node Registry**: Add, list, and delete nodes with automatic alphabetical sorting
-- **🔍 Role Monitoring**: Retrieve and display node roles, configurations, and status
-- **📊 Real-time Status**: Monitor Mixnode, Gateway, Network Requester, and IP Packet Router states
-- **🔒 WireGuard Integration**: Track WireGuard status and port configurations
+Nym Node Manager is a powerful bash-based tool that simplifies the management of Nym network nodes and cryptocurrency wallets. With an intuitive dialog-based interface, it provides centralized control over multiple nodes, secure wallet management, and automated operations.
 
-### Batch Operations
-- **🔄 Multi-Node Updates**: Update nym-node binaries across multiple nodes simultaneously
-- **⚙️ Bulk Configuration**: Apply Wireguard and Mixnet settings to multiple nodes at once
-- **🔄 Mass Service Restart**: Restart services across your entire node fleet
-- **✅ Select All Option**: Quickly select all nodes for any batch operation
+### Key Highlights
 
-### Configuration Management
-- **🔧 Persistent Settings**: Custom SSH ports, service names, and binary paths
-- **💾 Config File**: All settings automatically saved to `config.txt`
-- **🔄 Easy Reset**: One-click restore to default settings
-- **🌐 Custom SSH Ports**: Support for non-standard SSH ports (1-65535)
+- 🖥️ **Multi-Node Management** - Control multiple Nym nodes from a single interface
+- 💰 **Integrated Wallet Operations** - Manage wallets with AES-256 encryption
+- 🔐 **Security First** - Encrypted storage, secure SSH, no plaintext credentials
+- 🚀 **Batch Operations** - Execute commands across multiple nodes/wallets simultaneously
+- 📊 **Real-Time Data** - Live balance and rewards tracking from Nym network
+- 🎨 **User-Friendly** - Clean terminal UI with dialog menus
 
-### Advanced Features
-- **🧪 SSH Testing**: Comprehensive 7-step SSH connectivity and configuration validation
-- **📝 Debug Logging**: Detailed logging for troubleshooting and audit trails
-- **🔒 Secure Operations**: Password-protected SSH with sudo privilege escalation
-- **📁 Automatic Backups**: Binary backups before updates with timestamp preservation
+---
 
-## 📋 Prerequisites
+## ✨ Features
 
-### Required Packages
-```bash
-# Ubuntu/Debian
-sudo apt-get update
-sudo apt-get install dialog sshpass curl
+### 🔧 Node Management
 
-# CentOS/RHEL
-sudo yum install dialog sshpass curl
-```
+- **Add/Edit/Delete Nodes** - Full CRUD operations for your node fleet
+- **Alphabetical Organization** - Nodes automatically sorted for easy navigation
+- **Node Configuration Tracking** - Store IPs, Node IDs, and custom identifiers
+- **Bulk Selection** - Multi-select for batch operations
 
-### System Requirements
-- **OS**: Linux-based system (Ubuntu, Debian, CentOS, RHEL)
-- **Network**: SSH access to target Nym nodes
-- **Permissions**: Sudo access on target nodes
-- **Dependencies**: `dialog`, `sshpass`, `curl`
+### ⚙️ Node Operations
 
-## 🛠️ Installation
+- **Retrieve Node Roles** - View mixnet, entry gateway, and exit gateway configurations
+- **Automated Backups** - Rsync-based backup of node data
+- **Binary Updates** - One-click updates to latest nym-node version
+- **Toggle Functionality** - Enable/disable node features on the fly
+- **Service Management** - Restart services across multiple nodes
+- **Custom SSH Commands** - Execute arbitrary commands with sudo support
 
-### Quick Setup
+### 💳 Wallet Operations
+
+- **Secure Wallet Storage** - AES-256-CBC encryption with PBKDF2
+- **Multi-Wallet Support** - Manage unlimited wallets
+- **Real-Time Balances** - Live balance queries via nym-cli
+- **Operator Rewards** - View and claim pending operator rewards
+- **Transaction Creation** - Send NYM tokens with validation
+- **Batch Operations** - Query/withdraw from multiple wallets at once
+- **Export/Import** - Securely backup and restore wallet mnemonics
+
+### 🛠️ Configuration
+
+- **Custom SSH Ports** - Non-standard port support
+- **Service Name Configuration** - Custom systemd service names
+- **Binary Path Management** - Specify custom binary locations
+- **Persistent Settings** - Configuration saved between sessions
+
+### 🔍 Diagnostics
+
+- **SSH Connection Testing** - 7-step verification process
+- **Debug Logging** - Comprehensive activity logs
+- **Service Status Checks** - Verify systemd service states
+- **Sudo Access Verification** - Test privilege escalation
+
+---
+
+## 📦 Installation
+
+### Quick Start
+
 ```bash
 # Download the script
-wget https://github.com/yourusername/nym-node-manager/releases/latest/download/nym_node_manager.sh
+wget https://github.com/yourusername/nym-node-manager/releases/download/v66/nym_node_manager_v66.sh
 
 # Make executable
-chmod +x nym_node_manager.sh
-
-# Run the script
-./nym_node_manager.sh
-```
-
-### Manual Installation
-```bash
-# Clone the repository
-git clone https://github.com/yourusername/nym-node-manager.git
-cd nym-node-manager
-
-# Make executable
-chmod +x nym_node_manager.sh
+chmod +x nym_node_manager_v66.sh
 
 # Run
-./nym_node_manager.sh
+./nym_node_manager_v66.sh
 ```
 
-## 📖 Usage Guide
+### Requirements
 
-### Initial Setup
+The script automatically installs missing dependencies on supported systems:
 
-1. **Launch the script**: `./nym_node_manager.sh`
-2. **Configure settings** (optional): Use menu option 8 to customize SSH ports, service names, or binary paths
-3. **Add your nodes**: Use menu option 2 to add your Nym nodes
-4. **Retrieve node roles**: Use menu option 4 to fetch current configurations
+**Required:**
+- `dialog` - Terminal UI framework
+- `expect` - SSH automation
+- `curl` - HTTP requests
+- `rsync` - File synchronization
+- `sshpass` - SSH authentication (optional, for password auth)
+- `openssl` - Encryption
+- `jq` - JSON parsing
 
-### Menu Overview
+**Optional (for wallet operations):**
+- `nym-cli` - Nym command-line tool
+  - Download: https://github.com/nymtech/nym/releases
+  - Required for wallet operations
 
-```
-┌─────────────────────────────────────┐
-│         Nym Node Manager v46        │
-├─────────────────────────────────────┤
-│ 1  List all nodes                   │
-│ 2  Add node                         │
-│ 3  Delete node                      │
-│ 4  Retrieve node roles              │
-│ 5  Update nym-node                  │
-│ 6  Toggle node functionality        │
-│ 7  Restart service                  │
-│ 8  Config                           │
-│ 9  Test SSH                         │
-│ 10 Show debug log                   │
-│ 0  Exit                             │
-└─────────────────────────────────────┘
-```
+### Supported Systems
 
-## 🔧 Detailed Functions
+- ✅ Ubuntu/Debian (apt-get)
+- ✅ macOS (Homebrew)
+- ✅ Any Linux with bash 4.0+
 
-### 1. List All Nodes
-**Purpose**: Display comprehensive overview of all registered nodes
+---
 
-**Features**:
-- Alphabetically sorted node listing
-- Real-time status indicators with color coding
-- Role configurations (Mixnode, Gateway, Network Requester, IP Packet Router)
-- WireGuard status and port information
-- Build version information
+## 🚀 Usage
 
-**Output Example**:
-```
-🖥️ NODE: MyNode-01
-────────────────────────────────────────
-🌐 IP: 192.168.1.100
-📦 Version: 2025.13.0
-🔀 Mixnode: ✅ Enabled
-🚪 Gateway: ❌ Disabled
-🌍 Network Requester: ✅ Enabled
-📦 IP Packet Router: ❌ Disabled
-🔒 WireGuard: ✅ enabled (port: 51820)
-```
+### First-Time Setup
 
-### 2. Add Node
-**Purpose**: Register new Nym nodes in the management system
+1. **Launch the script:**
+   ```bash
+   ./nym_node_manager_v66.sh
+   ```
 
-**Process**:
-1. Enter node name (used for identification)
-2. Enter IP address
-3. Automatic alphabetical insertion in node registry
+2. **Add your first node:**
+   - Select: `1. Node Management` → `2. Add node`
+   - Enter: Node name, IP address, Node ID
 
-**Features**:
-- Duplicate prevention
-- Input validation
-- Automatic sorting
+3. **Import a wallet (optional):**
+   - Select: `3. Wallet Operations` → `1. Add new wallet`
+   - Enter: Wallet name, 24-word mnemonic, encryption password
 
-### 3. Delete Node
-**Purpose**: Remove nodes from management (supports multi-selection)
-
-**Features**:
-- **Multi-selection**: Choose multiple nodes for deletion
-- **Select All**: Quickly select all nodes
-- **Confirmation dialog**: Prevents accidental deletions
-- **Permanent removal**: Cannot be undone
-
-**Use Cases**:
-- Decommissioning nodes
-- Cleaning up test environments
-- Bulk node removal
-
-### 4. Retrieve Node Roles
-**Purpose**: Fetch current configuration and status from all registered nodes
-
-**Process**:
-1. Connects to each node's API (port 8080)
-2. Retrieves role information (`/api/v1/roles`)
-3. Fetches gateway configuration (`/api/v1/gateway`)
-4. Gets build information (`/api/v1/build-information`)
-5. Updates local node registry with fresh data
-
-**Retrieved Information**:
-- Mixnode status
-- Gateway status  
-- Network Requester status
-- IP Packet Router status
-- WireGuard configuration
-- Build version
-
-### 5. Update Nym-Node
-**Purpose**: Update nym-node binaries across multiple nodes simultaneously
-
-**Features**:
-- **Multi-node selection**: Update multiple nodes at once
-- **Custom download URLs**: Support for any GitHub release or custom URL
-- **Automatic backup**: Creates timestamped backups before update
-- **Version verification**: Confirms successful update with version check
-- **Progress tracking**: Real-time progress for batch operations
-- **Rollback capability**: Backup files allow easy rollback if needed
-
-**Process**:
-1. Select target nodes (individual or all)
-2. Provide download URL for new binary
-3. Enter SSH credentials
-4. Automated process per node:
-   - Test SSH connectivity
-   - Navigate to binary directory
-   - Backup current binary
-   - Download new binary
-   - Set execute permissions
-   - Verify installation
-
-**Safety Features**:
-- Connection testing before modification
-- Automatic backup with timestamps
-- Error handling and reporting
-- Detailed success/failure reporting
-
-### 6. Toggle Node Functionality
-**Purpose**: Configure Wireguard and Mixnet settings across multiple nodes
-
-**Configuration Options**:
-- **Wireguard**: Enable/Disable
-- **Mixnet Mode**: Mixnode, Entry Gateway, Exit Gateway
-
-**Features**:
-- **Batch configuration**: Apply same settings to multiple nodes
-- **Service file modification**: Direct systemd service configuration
-- **Automatic backup**: Service files backed up before changes
-- **Daemon reload**: Automatic systemctl daemon-reload after changes
-
-**Use Cases**:
-- Switching node roles across fleet
-- Enabling/disabling WireGuard for security
-- Standardizing configurations
-
-### 7. Restart Service
-**Purpose**: Restart nym-node services across multiple nodes
-
-**Features**:
-- **Multi-node restart**: Restart services on multiple nodes simultaneously
-- **Status verification**: Confirms service status after restart
-- **Progress tracking**: Real-time progress for batch operations
-- **Error handling**: Continues processing even if individual nodes fail
-
-**Process**:
-1. Select target nodes
-2. Enter SSH credentials
-3. Restart systemd service on each node
-4. Verify service status
-5. Report results
-
-### 8. Config (Configuration Menu)
-**Purpose**: Manage persistent script configuration
-
-**Configuration Options**:
-
-#### 8.1 Custom SSH Port
-- **Default**: 22
-- **Range**: 1-65535
-- **Purpose**: Support for non-standard SSH ports
-- **Validation**: Ensures valid port numbers
-
-#### 8.2 Systemd Service Name
-- **Default**: `nym-node.service`
-- **Purpose**: Support for custom service names
-- **Auto-extension**: Automatically adds `.service` if omitted
-
-#### 8.3 Custom Binary Folder
-- **Default**: `/root/nym`
-- **Purpose**: Support for custom binary locations
-- **Path handling**: Removes trailing slashes automatically
-
-#### 8.4 Reset to Defaults
-- **Purpose**: Restore all settings to defaults
-- **Confirmation**: Requires user confirmation
-- **Immediate effect**: Changes apply instantly
-
-**Persistence**:
-- All settings saved to `config.txt`
-- Automatically loaded on script startup
-- Survives script restarts
-
-### 9. Test SSH
-**Purpose**: Comprehensive SSH connectivity and configuration testing
-
-**Test Suite** (7 Tests):
-1. **Basic Connection**: Verifies SSH connectivity
-2. **Working Directory**: Confirms access and path
-3. **User Identity**: Validates user account
-4. **Sudo Access**: Tests privilege escalation
-5. **Root Switch**: Verifies sudo su capability
-6. **Service File**: Confirms systemd service file exists
-7. **Systemctl**: Tests service status checking
-
-**Features**:
-- **Step-by-step progress**: Visual progress indicator
-- **Detailed results**: Success/failure with output details
-- **Configuration display**: Shows current SSH port and service settings
-- **Troubleshooting aid**: Identifies specific connectivity issues
-
-### 10. Show Debug Log
-**Purpose**: Display recent debug and error information
-
-**Features**:
-- **Last 50 entries**: Most recent log entries
-- **Timestamped entries**: Precise timing information
-- **Function tracking**: Shows which functions were called
-- **Error details**: SSH errors, connection issues, and failures
-
-**Log Categories**:
-- `MAIN`: Application lifecycle
-- `FUNCTION`: Function calls
-- `SSH`: SSH operations and errors
-- `CONFIG`: Configuration changes
-- `UPDATE`: Binary updates
-- `RESTART`: Service operations
-
-## 📁 File Structure
+### Menu Structure
 
 ```
-nym-node-manager/
-├── nym_node_manager.sh    # Main script
-├── nodes.txt              # Node registry (auto-created)
-├── config.txt             # Configuration file (auto-created)
-├── debug.log              # Debug logging (auto-created)
-└── README.md              # This file
-```
-
-### File Descriptions
-
-**`nodes.txt`**: Stores node information including names, IPs, roles, and status
-**`config.txt`**: Persistent configuration (SSH port, service name, binary path)
-**`debug.log`**: Detailed logging for troubleshooting and audit trails
-
-## 🔒 Security Considerations
-
-### SSH Security
-- **Password Authentication**: Uses sshpass for automated authentication
-- **Host Key Checking**: Disabled for automation (consider security implications)
-- **Timeout Controls**: 10-second connection timeout prevents hanging
-- **Privilege Escalation**: Secure sudo access for required operations
-
-### Best Practices
-- **Use SSH Keys**: Consider implementing SSH key authentication
-- **Network Security**: Ensure proper firewall rules
-- **Access Control**: Limit script access to authorized users
-- **Regular Updates**: Keep dependencies updated
-- **Audit Logging**: Review debug logs regularly
-
-### Recommendations
-```bash
-# Set restrictive permissions
-chmod 700 nym_node_manager.sh
-chmod 600 config.txt nodes.txt
-
-# Consider using SSH keys instead of passwords
-ssh-keygen -t rsa -b 4096
-ssh-copy-id user@node-ip
-```
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-#### SSH Connection Failures
-```bash
-# Check connectivity
-ping node-ip
-
-# Verify SSH service
-ssh user@node-ip -p custom-port
-
-# Check SSH configuration
-ssh -v user@node-ip
-```
-
-#### Permission Denied
-```bash
-# Verify sudo access
-sudo whoami
-
-# Check service file permissions
-ls -la /etc/systemd/system/nym-node.service
-```
-
-#### Service Start Failures
-```bash
-# Check service status
-systemctl status nym-node.service
-
-# View service logs
-journalctl -u nym-node.service -n 50
-```
-
-### Debug Information
-- **Debug Log**: Menu option 10 shows recent operations and errors
-- **Verbose SSH**: SSH operations logged with full command details
-- **Function Tracking**: All function calls logged with timestamps
-
-## 📊 Configuration Examples
-
-### Standard Setup
-```bash
-SSH_PORT=22
-SERVICE_NAME=nym-node.service
-BINARY_PATH=/root/nym
-```
-
-### Custom Setup
-```bash
-SSH_PORT=2222
-SERVICE_NAME=nym-custom.service
-BINARY_PATH=/opt/nym-node
-```
-
-### Enterprise Setup
-```bash
-SSH_PORT=9922
-SERVICE_NAME=nym-production.service
-BINARY_PATH=/usr/local/bin/nym
-```
-
-## 🤝 Contributing
-
-### Bug Reports
-1. Check existing issues
-2. Provide detailed reproduction steps
-3. Include debug log output
-4. Specify system information
-
-### Feature Requests
-1. Describe the use case
-2. Explain the expected behavior
-3. Consider backward compatibility
-
-### Pull Requests
-1. Fork the repository
-2. Create a feature branch
-3. Test thoroughly
-4. Update documentation
-5. Submit pull request
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🔗 Related Projects
-
-- [Nym Network](https://github.com/nymtech/nym) - The main Nym project
-- [Nym Docs](https://nymtech.net/docs/) - Official documentation
-
-## ⚡ Quick Reference
-
-### Essential Commands
-```bash
-# Start the manager
-./nym_node_manager.sh
-
-# Make executable (if needed)
-chmod +x nym_node_manager.sh
-
-# View debug information
-tail -f debug.log
-
-# Check configuration
-cat config.txt
-```
-
-### Directory Structure
-```
-Working Directory/
-├── nym_node_manager.sh    # The script
-├── nodes.txt              # Your nodes
-├── config.txt             # Your settings  
-└── debug.log              # Troubleshooting
+Nym Node Manager v66
+├── 1. Node Management
+│   ├── List all nodes
+│   ├── Add node
+│   ├── Edit node
+│   └── Delete node
+│
+├── 2. Node Operations
+│   ├── Retrieve node roles
+│   ├── Backup node
+│   ├── Update nym-node binary
+│   ├── Toggle functionality
+│   ├── Restart service
+│   └── Execute SSH command
+│
+├── 3. Wallet Operations
+│   ├── Add new wallet
+│   ├── List wallets (with balances & rewards)
+│   ├── Withdraw operator rewards
+│   ├── Create new transaction
+│   ├── Export wallet
+│   └── Delete wallet
+│
+├── 4. Configuration
+│   ├── Custom SSH Port
+│   ├── Systemd Service Name
+│   ├── Custom Binary Folder
+│   └── Reset to Defaults
+│
+└── 5. Diagnostics
+    ├── Test SSH connection
+    └── Show debug log
 ```
 
 ---
 
-**Happy Node Managing! 🚀**
+## 💡 Common Use Cases
 
-For support, please create an issue on GitHub or check the debug logs for detailed error information.
+### Managing Multiple Nodes
+
+```
+1. Add all your nodes via "Node Management"
+2. Use "Retrieve node roles" to audit configurations
+3. Select multiple nodes for batch "Restart service"
+4. Use "Update nym-node binary" for fleet-wide updates
+```
+
+### Wallet Operations
+
+```
+1. Import wallets: "Add new wallet" with your mnemonics
+2. Check status: "List wallets" shows balances + rewards
+3. Claim rewards: "Withdraw operator rewards"
+4. Send tokens: "Create new transaction"
+```
+
+### Daily Monitoring
+
+```
+1. Launch script
+2. "List wallets" - Quick overview of all wallet states
+3. Check claimable operator rewards
+4. "Retrieve node roles" - Verify node configurations
+```
+
+### Backing Up Node Data
+
+```
+1. Select "Node Operations" → "Backup node"
+2. Choose node(s) to backup
+3. Enter SSH credentials
+4. Backup saved to ~/nym_backups/<nodename>_<timestamp>/
+```
+
+---
+
+## 🔐 Security
+
+### Wallet Security
+
+- **Encryption**: AES-256-CBC with PBKDF2 key derivation
+- **Storage**: Encrypted mnemonics in `~/.nym_wallets/wallet_list.txt`
+- **Memory**: Sensitive data cleared after use with `shred`
+- **Passwords**: Never logged or stored
+
+### SSH Security
+
+- **No Credential Storage**: SSH passwords entered per-session
+- **Sudo Support**: Secure privilege escalation
+- **Host Key Checking**: Can be configured per environment
+
+### Best Practices
+
+1. **Use strong passwords** for wallet encryption
+2. **Keep mnemonic backups** offline and secure
+3. **Regular exports** of wallet mnemonics to secure storage
+4. **Verify checksums** when downloading the script
+5. **Run from secure systems** - not on shared/public machines
+
+---
+
+## 📊 File Structure
+
+```
+.
+├── nym_node_manager_v66.sh    # Main script
+├── nodes.txt                  # Node configurations (auto-generated)
+├── config.txt                 # Settings (auto-generated)
+├── debug.log                  # Activity log (auto-generated)
+└── ~/.nym_wallets/            # Wallet storage (auto-generated)
+    └── wallet_list.txt        # Encrypted wallet data
+```
+
+---
+
+## 🔄 Upgrading
+
+### From v58 or earlier:
+
+1. Download v66
+2. Run the new script
+3. Existing `nodes.txt` and `config.txt` are preserved
+4. Import your wallets using "Add new wallet"
+
+### Preserving Data:
+
+Your node configurations are stored in:
+- `nodes.txt` - Node list
+- `config.txt` - Settings
+- `~/.nym_wallets/` - Encrypted wallets
+
+These files persist across versions.
+
+---
+
+## 🛠️ Advanced Configuration
+
+### Custom SSH Port
+
+```
+Main Menu → Configuration → Custom SSH Port
+```
+Set once, applies to all nodes.
+
+### Custom Service Name
+
+```
+Main Menu → Configuration → Systemd Service Name
+```
+Useful if your nodes use custom service names.
+
+### Custom Binary Path
+
+```
+Main Menu → Configuration → Custom Binary Folder
+```
+Specify where nym-node binary is located on remote servers.
+
+---
+
+## 📝 Troubleshooting
+
+### "nym-cli not found"
+
+**Solution:** Install nym-cli for wallet operations:
+```bash
+# Download from GitHub
+wget https://github.com/nymtech/nym/releases/latest/download/nym-cli
+chmod +x nym-cli
+sudo mv nym-cli /usr/local/bin/
+```
+
+### SSH Connection Fails
+
+**Solution:** Use the diagnostic tool:
+```
+Main Menu → Diagnostics → Test SSH connection
+```
+This runs 7 tests to identify the issue.
+
+### "Wrong password" on Wallet Operations
+
+**Solution:** 
+- Ensure you're using the correct encryption password
+- Password is case-sensitive
+- Try "Export wallet" to verify password separately
+
+### Script Hangs on Remote Commands
+
+**Solution:**
+- Check SSH connectivity manually
+- Verify sudo password is correct
+- Check `debug.log` for detailed error messages
+
+### Wallet Balance Shows 0
+
+**Solution:**
+- Verify nym-cli is installed and in PATH
+- Check network connectivity to Nym validators
+- Ensure wallet address is correct (use "List wallets")
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! Please:
+
+1. Fork the repository
+2. Create a feature branch
+3. Test thoroughly
+4. Submit a pull request
+
+### Areas for Contribution
+
+- Additional node operations
+- Support for more cryptocurrencies
+- GUI version
+- Docker containerization
+- Automated testing suite
+
+---
+
+## 📜 Changelog
+
+See [RELEASE_NOTES.md](RELEASE_NOTES_v66.md) for detailed version history.
+
+**Latest (v66):**
+- Refined wallet display labels
+- Removed uNYM values (NYM only)
+- Integrated rewards query into wallet list
+- Reordered menu items for better UX
+
+---
+
+## 📄 License
+
+MIT License - See LICENSE file for details.
+
+---
+
+## 🔗 Links
+
+- **Nym Project**: https://nymtech.net
+- **Nym GitHub**: https://github.com/nymtech/nym
+- **Nym Documentation**: https://nymtech.net/docs
+- **Download nym-cli**: https://github.com/nymtech/nym/releases
+
+---
+
+## ⚠️ Disclaimer
+
+This tool is provided as-is for managing Nym network nodes and wallets. The authors are not responsible for:
+
+- Loss of funds due to misuse
+- Node downtime or misconfigurations
+- Security breaches on your systems
+
+**Always:**
+- Keep backups of your mnemonics
+- Test on non-production systems first
+- Verify the script source code before use
+- Use strong passwords and secure systems
+
+---
+
+## 🙏 Acknowledgments
+
+- Nym Technologies for the Nym network
+- The open-source community for dependencies
+- Contributors and testers
+
+---
+
+## 📧 Support
+
+For issues, questions, or feature requests:
+- Open an issue on GitHub
+- Check existing issues for solutions
+- Review the troubleshooting section above
+
+---
+
+**Made with ❤️ for the Nym community**
+
+*Manage your Nym nodes and wallets with confidence.*
