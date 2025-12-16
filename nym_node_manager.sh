@@ -1,29 +1,11 @@
 #!/bin/bash
 
 # ============================================================================
-# Nym Node Manager v83 - Password Security Fix
+# Nym Node Manager v76 - Merged Version
 # ============================================================================
 # Description: Centralized management tool for Nym network nodes
-# Requirements: dialog, expect, curl, rsync, openssl, nym-cli, jq
+# Requirements: dialog, expect, curl, rsync, sshpass, openssl, nym-cli, jq
 # Features: Multi-node operations, backup, updates, configuration, wallet mgmt
-# 
-# Changelog v83:
-#   - Fixed: Password no longer appears in debug.log (Line 256)
-#   - Security: Redacted password from root command logging
-#   - All v82 functionality preserved
-# 
-# Changelog v82:
-#   - Added "Disable root@ssh" security feature (from v78)
-#   - Added "Fail2ban" management feature (from v78)
-#   - All v77 wallet operations preserved (user-password encryption, .enc files)
-#   - All v77 node operations preserved
-#   - Clean build: v77 base + v78 security only
-# 
-# Changelog v77:
-#   - Added hostname support for nodes
-#   - Hostname prompt when adding new nodes (order: IP, Hostname, ID)
-#   - Ability to add/edit hostname for existing nodes via "Edit node"
-#   - All other functionality preserved from v76
 # 
 # Changelog v76 (Merged):
 #   - Base functionality from v61_BACKUP
@@ -47,7 +29,7 @@
 # ----------------------------------------------------------------------------
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 SCRIPT_NAME="Nym Node Manager"
-VERSION="83"
+VERSION="76"
 SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
 DEBUG_LOG="$SCRIPT_DIR/debug.log"
 NODES_FILE="$SCRIPT_DIR/nodes.txt"
@@ -67,7 +49,6 @@ BINARY_PATH=""
 
 SELECTED_NODES_NAMES=()
 SELECTED_NODES_IPS=()
-SELECTED_NODES_HOSTNAMES=()
 SELECTED_NODES_IDS=()
 
 # ----------------------------------------------------------------------------
@@ -145,25 +126,22 @@ node_name_exists() {
 }
 
 parse_nodes_file() {
-    names=(); ips=(); hostnames=(); node_ids=()
+    names=(); ips=(); node_ids=()
     [[ ! -f "$NODES_FILE" || ! -s "$NODES_FILE" ]] && return 1
     
-    local name="" ip="" hostname="" node_id=""
+    local name="" ip="" node_id=""
     while IFS= read -r line; do
         if [[ "$line" =~ ^Node\ Name:\ (.+)$ ]]; then
             name="${BASH_REMATCH[1]}"
         elif [[ "$line" =~ ^IP\ Address:\ (.+)$ ]]; then
             ip="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^Hostname:\ (.+)$ ]]; then
-            hostname="${BASH_REMATCH[1]}"
         elif [[ "$line" =~ ^Node\ ID:\ (.+)$ ]]; then
             node_id="${BASH_REMATCH[1]}"
             if [[ -n "$name" && -n "$ip" && -n "$node_id" ]]; then
                 names+=("$name")
                 ips+=("$ip")
-                hostnames+=("${hostname:-N/A}")
                 node_ids+=("$node_id")
-                name=""; ip=""; hostname=""; node_id=""
+                name=""; ip=""; node_id=""
             fi
         fi
     done < "$NODES_FILE"
@@ -195,11 +173,11 @@ sort_nodes_file() {
 }
 
 insert_node_sorted() {
-    local new_name="$1" new_ip="$2" new_hostname="$3" new_node_id="$4"
+    local new_name="$1" new_ip="$2" new_node_id="$3"
     local temp=$(mktemp) inserted=false
     
     if [[ ! -f "$NODES_FILE" ]]; then
-        echo -e "Node Name: $new_name\nIP Address: $new_ip\nHostname: $new_hostname\nNode ID: $new_node_id" > "$NODES_FILE"
+        echo -e "Node Name: $new_name\nIP Address: $new_ip\nNode ID: $new_node_id" > "$NODES_FILE"
         return
     fi
     
@@ -208,7 +186,7 @@ insert_node_sorted() {
             local node_name="${BASH_REMATCH[1]}"
             if [[ "$inserted" == "false" && "$new_name" < "$node_name" ]]; then
                 [[ -s "$temp" ]] && echo >> "$temp"
-                echo -e "Node Name: $new_name\nIP Address: $new_ip\nHostname: $new_hostname\nNode ID: $new_node_id\n" >> "$temp"
+                echo -e "Node Name: $new_name\nIP Address: $new_ip\nNode ID: $new_node_id\n" >> "$temp"
                 inserted=true
             fi
             [[ -s "$temp" ]] && echo >> "$temp"
@@ -218,7 +196,7 @@ insert_node_sorted() {
     
     if [[ "$inserted" == "false" ]]; then
         [[ -s "$temp" ]] && echo >> "$temp"
-        echo -e "Node Name: $new_name\nIP Address: $new_ip\nHostname: $new_hostname\nNode ID: $new_node_id" >> "$temp"
+        echo -e "Node Name: $new_name\nIP Address: $new_ip\nNode ID: $new_node_id" >> "$temp"
     fi
     mv "$temp" "$NODES_FILE"
 }
@@ -258,8 +236,7 @@ ssh_exec() {
         # Escape special characters for the nested command
         local escaped_cmd=$(echo "$cmd" | sed 's/"/\\"/g')
         cmd="echo '$pass' | sudo -S bash -c \"$escaped_cmd\""
-        # Log without exposing password
-        log "SSH_EXEC" "Root command: echo '[REDACTED]' | sudo -S bash -c \"$escaped_cmd\""
+        log "SSH_EXEC" "Root command: $cmd"
     fi
     
     local expect_script=$(mktemp)
@@ -412,9 +389,9 @@ EXPECTEOF
 
 select_nodes() {
     local mode="${1:-single}" title="${2:-Select Node}"
-    SELECTED_NODES_NAMES=(); SELECTED_NODES_IPS=(); SELECTED_NODES_HOSTNAMES=(); SELECTED_NODES_IDS=()
+    SELECTED_NODES_NAMES=(); SELECTED_NODES_IPS=(); SELECTED_NODES_IDS=()
     
-    local names=() ips=() hostnames=() node_ids=()
+    local names=() ips=() node_ids=()
     parse_nodes_file || { show_error "No nodes found. Add nodes first."; return 1; }
     
     local options=() counter=1
@@ -442,14 +419,12 @@ select_nodes() {
         if [[ "$choice" == "ALL" ]]; then
             SELECTED_NODES_NAMES=("${names[@]}")
             SELECTED_NODES_IPS=("${ips[@]}")
-            SELECTED_NODES_HOSTNAMES=("${hostnames[@]}")
             SELECTED_NODES_IDS=("${node_ids[@]}")
             break
         else
             local idx=$((choice - 1))
             SELECTED_NODES_NAMES+=("${names[$idx]}")
             SELECTED_NODES_IPS+=("${ips[$idx]}")
-            SELECTED_NODES_HOSTNAMES+=("${hostnames[$idx]}")
             SELECTED_NODES_IDS+=("${node_ids[$idx]}")
         fi
     done
@@ -496,7 +471,6 @@ list_nodes() {
             "Node Name: "*) [[ -n "$current_node" ]] && content+="\n"
                 content+="🖥️ NODE: ${line#Node Name: }\n────────────────────────────────────────\n"; current_node="yes" ;;
             "IP Address: "*) content+="🌐 IP: ${line#IP Address: }\n" ;;
-            "Hostname: "*) content+="🏷️ Hostname: ${line#Hostname: }\n" ;;
             "Node ID: "*) content+="🆔 ID: ${line#Node ID: }\n" ;;
             "Build Version: "*) content+="📦 Version: ${line#Build Version: }\n" ;;
             *"mixnode"*"true"*) content+="🔀 Mixnode: \Z2✅ Enabled\Zn\n" ;;
@@ -527,20 +501,17 @@ add_node() {
     local ip=$(get_input "Add Node" "Enter IP Address for '$name':")
     [[ -z "$ip" ]] && { show_msg "Cancelled" "Node creation cancelled."; return; }
     
-    local hostname=$(get_input "Add Node" "Enter Hostname for '$name' (optional):")
-    [[ -z "$hostname" ]] && hostname="N/A"
-    
     local node_id=$(get_input "Add Node" "Enter Node ID for '$name':\n(The ID used during node initialization)")
     [[ -z "$node_id" ]] && { show_msg "Cancelled" "Node creation cancelled."; return; }
     
-    insert_node_sorted "$name" "$ip" "$hostname" "$node_id"
-    show_success "Node '$name' added successfully!\nIP: $ip\nHostname: $hostname\nID: $node_id"
+    insert_node_sorted "$name" "$ip" "$node_id"
+    show_success "Node '$name' added successfully!\nIP: $ip\nID: $node_id"
 }
 
 edit_node() {
     select_nodes "single" "Edit Node" || return
     
-    local old_name="${SELECTED_NODES_NAMES[0]}" old_ip="${SELECTED_NODES_IPS[0]}" old_hostname="${SELECTED_NODES_HOSTNAMES[0]}" old_id="${SELECTED_NODES_IDS[0]}"
+    local old_name="${SELECTED_NODES_NAMES[0]}" old_ip="${SELECTED_NODES_IPS[0]}" old_id="${SELECTED_NODES_IDS[0]}"
     local new_name="" attempt=0
     
     while true; do
@@ -554,16 +525,12 @@ edit_node() {
     local new_ip=$(dialog --title "Edit IP Address" --inputbox "Enter new IP Address:" 8 50 "$old_ip" 3>&1 1>&2 2>&3)
     [[ $? -ne 0 || -z "$new_ip" ]] && { show_msg "Cancelled" "Edit cancelled."; return; }
     
-    local new_hostname=$(dialog --title "Edit Hostname" --inputbox "Enter new Hostname:" 8 50 "$old_hostname" 3>&1 1>&2 2>&3)
-    [[ $? -ne 0 ]] && { show_msg "Cancelled" "Edit cancelled."; return; }
-    [[ -z "$new_hostname" ]] && new_hostname="N/A"
-    
     local new_id=$(dialog --title "Edit Node ID" --inputbox "Enter new Node ID:" 8 50 "$old_id" 3>&1 1>&2 2>&3)
     [[ $? -ne 0 || -z "$new_id" ]] && { show_msg "Cancelled" "Edit cancelled."; return; }
     
     remove_nodes_from_file "$old_name"
-    insert_node_sorted "$new_name" "$new_ip" "$new_hostname" "$new_id"
-    show_success "Node updated!\n\nOld: $old_name ($old_ip) - $old_hostname - $old_id\nNew: $new_name ($new_ip) - $new_hostname - $new_id"
+    insert_node_sorted "$new_name" "$new_ip" "$new_id"
+    show_success "Node updated!\n\nOld: $old_name ($old_ip) - $old_id\nNew: $new_name ($new_ip) - $new_id"
 }
 
 delete_node() {
@@ -588,20 +555,20 @@ retrieve_node_roles() {
     
     local clean_file=$(mktemp)
     while IFS= read -r line; do
-        [[ "$line" =~ ^(Node\ Name:|IP\ Address:|Hostname:|Node\ ID:) || -z "$line" ]] && echo "$line" >> "$clean_file"
+        [[ "$line" =~ ^(Node\ Name:|IP\ Address:|Node\ ID:) || -z "$line" ]] && echo "$line" >> "$clean_file"
     done < "$NODES_FILE"
     
-    local names=() ips=() hostnames=() node_ids=()
+    local names=() ips=() node_ids=()
     parse_nodes_file
     local total=${#names[@]} processed=0
     
     local temp=$(mktemp)
     for ((i=0; i<total; i++)); do
-        local name="${names[i]}" ip="${ips[i]}" hostname="${hostnames[i]}" node_id="${node_ids[i]}"
+        local name="${names[i]}" ip="${ips[i]}" node_id="${node_ids[i]}"
         ((processed++))
         dialog --title "Retrieving Roles" --infobox "Processing $name ($processed/$total)..." 6 50
         
-        echo -e "Node Name: $name\nIP Address: $ip\nHostname: $hostname\nNode ID: $node_id" >> "$temp"
+        echo -e "Node Name: $name\nIP Address: $ip\nNode ID: $node_id" >> "$temp"
         
         local roles=$(curl -s --connect-timeout 5 --max-time 10 "http://$ip:8080/api/v1/roles" 2>/dev/null)
         local gateway=$(curl -s --connect-timeout 5 --max-time 10 "http://$ip:8080/api/v1/gateway" 2>/dev/null)
@@ -1049,663 +1016,6 @@ restart_service() {
     show_operation_results "🔄 Service Restart" successful failed "🎯 Service Restart Complete!"
 }
 
-disable_root_ssh() {
-    select_nodes "multi" "Disable root@ssh" || return
-    
-    local user=$(get_input "SSH Credentials" "SSH username:")
-    [[ -z "$user" ]] && return
-    
-    local pass=$(get_password "SSH Credentials" "SSH password for $user:")
-    [[ -z "$pass" ]] && return
-    
-    local results="🔒 Disable root@ssh Results\n════════════════════════════════════════════════════════════════\n\n"
-    
-    for i in "${!SELECTED_NODES_NAMES[@]}"; do
-        local name="${SELECTED_NODES_NAMES[i]}" ip="${SELECTED_NODES_IPS[i]}"
-        dialog --title "Disabling root SSH" --infobox "Processing: $name ($ip)..." 5 50
-        
-        log "SSH_ROOT" "Processing node: $name ($ip)"
-        
-        # First, check current configuration
-        local check_cmd="grep -E '^#?PermitRootLogin' /etc/ssh/sshd_config | tail -1"
-        local current_config=$(ssh_exec "$ip" "$user" "$pass" "$check_cmd" "Check SSH config" "true" 2>&1)
-        
-        log "SSH_ROOT" "$name - Current config: $current_config"
-        
-        # Check if already disabled
-        if echo "$current_config" | grep -q "^PermitRootLogin no"; then
-            results+="⏭️  $name ($ip) - Root SSH already disabled, skipping\n\n"
-            log "SSH_ROOT" "$name - Already disabled, skipping"
-            continue
-        fi
-        
-        # Disable root login
-        local disable_cmd="sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config && echo 'CONFIG_UPDATED'"
-        local disable_output=$(ssh_exec "$ip" "$user" "$pass" "$disable_cmd" "Disable root SSH" "true" 2>&1)
-        
-        if [[ "$disable_output" != *"CONFIG_UPDATED"* ]]; then
-            results+="❌ $name ($ip) - Failed to update SSH configuration\n\n"
-            log "SSH_ROOT" "$name - Failed to update config"
-            continue
-        fi
-        
-        log "SSH_ROOT" "$name - Configuration updated"
-        
-        # Restart SSH daemon
-        local restart_cmd="systemctl restart sshd && echo 'SSHD_RESTARTED'"
-        local restart_output=$(ssh_exec "$ip" "$user" "$pass" "$restart_cmd" "Restart SSHD" "true" 2>&1)
-        
-        if [[ "$restart_output" != *"SSHD_RESTARTED"* ]]; then
-            results+="❌ $name ($ip) - Configuration updated but failed to restart SSHD\n\n"
-            log "SSH_ROOT" "$name - Failed to restart SSHD"
-            continue
-        fi
-        
-        log "SSH_ROOT" "$name - SSHD restarted"
-        
-        results+="✅ $name ($ip) - Root SSH disabled successfully\n   ✓ Configuration updated\n   ✓ SSHD restarted\n\n"
-        log "SSH_ROOT" "$name - Successfully disabled"
-    done
-    
-    show_success "$results"
-}
-
-# ----------------------------------------------------------------------------
-# FAIL2BAN ACTIVATION AND CONFIGURATION
-# ----------------------------------------------------------------------------
-
-activate_fail2ban() {
-    local action=$(dialog --clear --title "Fail2ban Management" --menu "Select action:" 12 60 4 \
-        1 "Install & Configure Fail2ban" \
-        2 "Check jailed IPs" \
-        3 "Adjust fail2ban settings" \
-        0 "Back" 3>&1 1>&2 2>&3)
-    
-    [[ $? -ne 0 || "$action" == "0" ]] && return
-    
-    case $action in
-        1) fail2ban_install_configure ;;
-        2) fail2ban_check_jailed ;;
-        3) fail2ban_adjust_settings ;;
-    esac
-}
-
-fail2ban_install_configure() {
-    select_nodes "multi" "Install & Configure Fail2ban" || return
-    
-    local user=$(get_input "SSH Credentials" "SSH username:")
-    [[ -z "$user" ]] && return
-    
-    local pass=$(get_password "SSH Credentials" "SSH password for $user:")
-    [[ -z "$pass" ]] && return
-    
-    local results="🔒 Fail2ban Installation Results\n════════════════════════════════════════════════════════════════\n\n"
-    local already_running=""
-    local newly_installed=""
-    local failed=""
-    
-    for i in "${!SELECTED_NODES_NAMES[@]}"; do
-        local name="${SELECTED_NODES_NAMES[i]}" ip="${SELECTED_NODES_IPS[i]}"
-        dialog --title "Configuring Fail2ban" --infobox "Processing: $name ($ip)..." 5 50
-        
-        log "FAIL2BAN" "$name - Checking if fail2ban is running"
-        
-        # First, check if fail2ban is already running
-        local output=$(expect -c "
-            log_user 0
-            set timeout 30
-            
-            spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $SSH_PORT $user@$ip
-            
-            expect {
-                \"password:\" {
-                    send \"$pass\r\"
-                    exp_continue
-                }
-                -re \"\\\\$\" {
-                    send \"sudo su\r\"
-                    expect {
-                        \"password\" {
-                            send \"$pass\r\"
-                            expect \"#\"
-                        }
-                        \"#\" {}
-                        timeout {
-                            puts \"SUDO_TIMEOUT\"
-                            exit 0
-                        }
-                    }
-                    
-                    # Check systemctl status
-                    send \"systemctl status fail2ban\r\"
-                    expect \"#\"
-                    set status_output \$expect_out(buffer)
-                    
-                    # Output the result - check for various patterns (case insensitive)
-                    set lower_output [string tolower \$status_output]
-                    if {[string match \"*could not be found*\" \$lower_output]} {
-                        puts \"NOT_FOUND\"
-                    } elseif {[string match \"*active (running)*\" \$lower_output]} {
-                        puts \"RUNNING\"
-                    } elseif {[string match \"*active: active*\" \$lower_output]} {
-                        puts \"RUNNING\"
-                    } else {
-                        puts \"NOT_RUNNING\"
-                    }
-                    
-                    send \"exit\r\"
-                    expect {
-                        \"\\\\$\" { send \"exit\r\" }
-                        timeout {}
-                    }
-                }
-                timeout {
-                    puts \"CONNECTION_TIMEOUT\"
-                    exit 0
-                }
-            }
-            
-            catch {expect eof}
-        " 2>&1)
-        
-        log "FAIL2BAN" "$name - Status check output: $output"
-        
-        # If already running, skip installation
-        if [[ "$output" == *"RUNNING"* ]]; then
-            already_running+="$name ($ip), "
-            log "FAIL2BAN" "$name - Already running, skipping"
-            continue
-        fi
-        
-        # Not running, proceed with installation
-        dialog --title "Installing Fail2ban" --infobox "Installing on: $name ($ip)..." 5 50
-        log "FAIL2BAN" "$name - Installing fail2ban"
-        
-        local install_output=$(expect -c "
-            log_user 0
-            set timeout 120
-            
-            spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $SSH_PORT $user@$ip
-            
-            expect {
-                \"password:\" {
-                    send \"$pass\r\"
-                    exp_continue
-                }
-                -re \"\\\\$\" {
-                    send \"sudo su\r\"
-                    expect {
-                        \"password\" {
-                            send \"$pass\r\"
-                            expect \"#\"
-                        }
-                        \"#\" {}
-                        timeout {
-                            puts \"SUDO_TIMEOUT\"
-                            exit 0
-                        }
-                    }
-                    
-                    # Install fail2ban
-                    send \"export DEBIAN_FRONTEND=noninteractive\r\"
-                    expect \"#\"
-                    send \"apt-get update -qq\r\"
-                    expect \"#\" { }
-                    send \"apt-get install -y fail2ban\r\"
-                    expect \"#\" { }
-                    
-                    # Create configuration
-                    send \"cat > /etc/fail2ban/jail.local << 'EOFMARKER'\r\"
-                    expect \">\"
-                    send \"\[DEFAULT\]\r\"
-                    expect \">\"
-                    send \"bantime = 1h\r\"
-                    expect \">\"
-                    send \"findtime = 10m\r\"
-                    expect \">\"
-                    send \"maxretry = 3\r\"
-                    expect \">\"
-                    send \"banaction = iptables-multiport\r\"
-                    expect \">\"
-                    send \"\r\"
-                    expect \">\"
-                    send \"\[sshd\]\r\"
-                    expect \">\"
-                    send \"enabled = true\r\"
-                    expect \">\"
-                    send \"port = ssh\r\"
-                    expect \">\"
-                    send \"logpath = %(sshd_log)s\r\"
-                    expect \">\"
-                    send \"backend = %(sshd_backend)s\r\"
-                    expect \">\"
-                    send \"EOFMARKER\r\"
-                    expect \"#\"
-                    
-                    # Enable and start service
-                    send \"systemctl enable fail2ban\r\"
-                    expect \"#\"
-                    send \"systemctl start fail2ban\r\"
-                    expect \"#\"
-                    
-                    # Verify it's running  
-                    send \"systemctl is-active fail2ban\r\"
-                    expect {
-                        \"active\" {
-                            puts \"INSTALL_SUCCESS\"
-                            expect \"#\"
-                        }
-                        -re \"inactive|failed\" {
-                            puts \"INSTALL_FAILED\"
-                            expect \"#\"
-                        }
-                        timeout {
-                            puts \"VERIFY_TIMEOUT\"
-                        }
-                    }
-                    
-                    send \"exit\r\"
-                    expect {
-                        \"\\\\$\" { send \"exit\r\" }
-                        timeout {}
-                    }
-                }
-                timeout {
-                    puts \"INSTALL_TIMEOUT\"
-                    exit 0
-                }
-            }
-            
-            catch {expect eof}
-        " 2>&1)
-        
-        log "FAIL2BAN" "$name - Installation output: $install_output"
-        
-        if [[ "$install_output" == *"INSTALL_SUCCESS"* ]]; then
-            newly_installed+="$name ($ip), "
-            log "FAIL2BAN" "$name - Successfully installed"
-        else
-            failed+="$name ($ip), "
-            log "FAIL2BAN" "$name - Installation failed"
-        fi
-    done
-    
-    # Build summary report
-    if [[ -n "$already_running" ]]; then
-        already_running="${already_running%, }"  # Remove trailing comma
-        results+="✅ Already configured (no changes made):\n   $already_running\n\n"
-    fi
-    
-    if [[ -n "$newly_installed" ]]; then
-        newly_installed="${newly_installed%, }"  # Remove trailing comma
-        results+="🆕 Newly installed and configured:\n   $newly_installed\n   • Max retries: 3 failed attempts\n   • Ban time: 1 hour\n   • Service: enabled and running\n\n"
-    fi
-    
-    if [[ -n "$failed" ]]; then
-        failed="${failed%, }"  # Remove trailing comma
-        results+="❌ Installation failed:\n   $failed\n\n"
-    fi
-    
-    show_success "$results"
-}
-
-fail2ban_adjust_settings() {
-    # Get current settings or use defaults
-    local maxretry=$(dialog --inputbox "Max failed attempts before ban:" 10 50 "3" 3>&1 1>&2 2>&3)
-    [[ $? -ne 0 || -z "$maxretry" ]] && return
-    
-    local bantime=$(dialog --inputbox "Ban duration (e.g., 1h, 30m, 2h):" 10 50 "1h" 3>&1 1>&2 2>&3)
-    [[ $? -ne 0 || -z "$bantime" ]] && return
-    
-    local findtime=$(dialog --inputbox "Time window for counting attempts (e.g., 10m, 5m):" 10 50 "10m" 3>&1 1>&2 2>&3)
-    [[ $? -ne 0 || -z "$findtime" ]] && return
-    
-    # Confirm settings
-    local confirm=$(dialog --title "Confirm Settings" --yesno "Apply these settings to selected nodes?\n\nMax retries: $maxretry\nBan time: $bantime\nFind time: $findtime" 12 60 3>&1 1>&2 2>&3)
-    [[ $? -ne 0 ]] && return
-    
-    select_nodes "multi" "Adjust Fail2ban Settings" || return
-    
-    local user=$(get_input "SSH Credentials" "SSH username:")
-    [[ -z "$user" ]] && return
-    
-    local pass=$(get_password "SSH Credentials" "SSH password for $user:")
-    [[ -z "$pass" ]] && return
-    
-    local results="⚙️ Fail2ban Settings Update Results\n════════════════════════════════════════════════════════════════\n\n"
-    
-    for i in "${!SELECTED_NODES_NAMES[@]}"; do
-        local name="${SELECTED_NODES_NAMES[i]}" ip="${SELECTED_NODES_IPS[i]}"
-        dialog --title "Updating Settings" --infobox "Processing: $name ($ip)..." 5 50
-        
-        log "FAIL2BAN_ADJUST" "$name - Updating settings: maxretry=$maxretry, bantime=$bantime, findtime=$findtime"
-        
-        local output=$(expect -c "
-            log_user 0
-            set timeout 30
-            
-            spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $SSH_PORT $user@$ip
-            
-            expect {
-                \"password:\" {
-                    send \"$pass\r\"
-                    exp_continue
-                }
-                -re \"\\\\$\" {
-                    send \"sudo su\r\"
-                    expect {
-                        \"password\" {
-                            send \"$pass\r\"
-                            expect \"#\"
-                        }
-                        \"#\" {}
-                        timeout {
-                            puts \"SUDO_TIMEOUT\"
-                            exit 0
-                        }
-                    }
-                    
-                    # Update configuration with new settings
-                    send \"cat > /etc/fail2ban/jail.local << 'EOFMARKER'\r\"
-                    expect \">\"
-                    send \"\[DEFAULT\]\r\"
-                    expect \">\"
-                    send \"bantime = $bantime\r\"
-                    expect \">\"
-                    send \"findtime = $findtime\r\"
-                    expect \">\"
-                    send \"maxretry = $maxretry\r\"
-                    expect \">\"
-                    send \"banaction = iptables-multiport\r\"
-                    expect \">\"
-                    send \"\r\"
-                    expect \">\"
-                    send \"\[sshd\]\r\"
-                    expect \">\"
-                    send \"enabled = true\r\"
-                    expect \">\"
-                    send \"port = ssh\r\"
-                    expect \">\"
-                    send \"logpath = %(sshd_log)s\r\"
-                    expect \">\"
-                    send \"backend = %(sshd_backend)s\r\"
-                    expect \">\"
-                    send \"EOFMARKER\r\"
-                    expect {
-                        \"#\" {
-                            puts \"CONFIG_UPDATED\"
-                        }
-                        timeout {
-                            puts \"CONFIG_TIMEOUT\"
-                        }
-                    }
-                    
-                    # Restart fail2ban to apply changes
-                    send \"systemctl restart fail2ban\r\"
-                    expect \"#\"
-                    
-                    # Verify it's still running
-                    send \"systemctl is-active fail2ban\r\"
-                    expect {
-                        \"active\" {
-                            puts \"UPDATE_SUCCESS\"
-                            expect \"#\"
-                        }
-                        -re \"inactive|failed\" {
-                            puts \"UPDATE_FAILED\"
-                            expect \"#\"
-                        }
-                        timeout {
-                            puts \"VERIFY_TIMEOUT\"
-                        }
-                    }
-                    
-                    send \"exit\r\"
-                    expect {
-                        \"\\\\$\" { send \"exit\r\" }
-                        timeout {}
-                    }
-                }
-                timeout {
-                    puts \"CONNECTION_TIMEOUT\"
-                    exit 0
-                }
-            }
-            
-            catch {expect eof}
-        " 2>&1)
-        
-        log "FAIL2BAN_ADJUST" "$name - Output: $output"
-        
-        if [[ "$output" == *"UPDATE_SUCCESS"* ]]; then
-            results+="✅ $name ($ip) - Settings updated successfully\n"
-            results+="   • Max retries: $maxretry\n"
-            results+="   • Ban time: $bantime\n"
-            results+="   • Find time: $findtime\n\n"
-            log "FAIL2BAN_ADJUST" "$name - Successfully updated"
-        elif [[ "$output" == *"UPDATE_FAILED"* ]]; then
-            results+="❌ $name ($ip) - Settings updated but service failed to restart\n\n"
-            log "FAIL2BAN_ADJUST" "$name - Service restart failed"
-        elif [[ "$output" == *"TIMEOUT"* ]]; then
-            results+="❌ $name ($ip) - Timeout during update\n\n"
-            log "FAIL2BAN_ADJUST" "$name - Timeout"
-        else
-            results+="❌ $name ($ip) - Update failed\n\n"
-            log "FAIL2BAN_ADJUST" "$name - Failed"
-        fi
-    done
-    
-    show_success "$results"
-}
-
-fail2ban_check_jailed() {
-    select_nodes "multi" "Check Jailed IPs" || return
-    
-    local user=$(get_input "SSH Credentials" "SSH username:")
-    [[ -z "$user" ]] && return
-    
-    local pass=$(get_password "SSH Credentials" "SSH password for $user:")
-    [[ -z "$pass" ]] && return
-    
-    local results="🚫 Jailed IPs Report\n════════════════════════════════════════════════════════════════\n\n"
-    local all_banned_ips=()
-    
-    for i in "${!SELECTED_NODES_NAMES[@]}"; do
-        local name="${SELECTED_NODES_NAMES[i]}" ip="${SELECTED_NODES_IPS[i]}"
-        dialog --title "Checking Jailed IPs" --infobox "Processing: $name ($ip)..." 5 50
-        
-        # Use expect directly to get jail status
-        local output=$(expect -c "
-            log_user 0
-            set timeout 30
-            
-            spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $SSH_PORT $user@$ip
-            
-            expect {
-                \"password:\" {
-                    send \"$pass\r\"
-                    exp_continue
-                }
-                -re \"\\\\$|#\" {
-                    # Elevate to root
-                    send \"sudo su\r\"
-                    expect {
-                        \"password\" {
-                            send \"$pass\r\"
-                            expect \"#\"
-                        }
-                        \"#\" {}
-                    }
-                    
-                    # Get jail status - wait for the prompt after command
-                    send \"fail2ban-client status sshd\r\"
-                    
-                    # Wait for the output and the next prompt
-                    expect \"#\"
-                    
-                    # Capture what we got
-                    set output \$expect_out(buffer)
-                    
-                    # Clean up and output
-                    puts \"===DATA_START===\"
-                    puts \$output
-                    puts \"===DATA_END===\"
-                    
-                    send \"exit\r\"
-                    expect \"\\\\$\"
-                    send \"exit\r\"
-                }
-                timeout {
-                    puts \"SSH_TIMEOUT\"
-                    exit 1
-                }
-            }
-            expect eof
-        " 2>&1)
-        
-        log "FAIL2BAN_JAIL" "$name - Raw output: $output"
-        
-        if [[ "$output" == *"===DATA_START==="* && "$output" == *"===DATA_END==="* ]]; then
-            # Extract the data between markers
-            local jail_data=$(echo "$output" | sed -n '/===DATA_START===/,/===DATA_END===/p' | sed '1d;$d')
-            
-            log "FAIL2BAN_JAIL" "$name - Parsed data: $jail_data"
-            
-            # Check if we got actual jail status
-            if [[ "$jail_data" == *"Status for the jail: sshd"* ]]; then
-                # Parse statistics - use awk which handles special characters better
-                local currently_banned=$(echo "$jail_data" | awk '/Currently banned:/ {print $NF}')
-                local total_banned=$(echo "$jail_data" | awk '/Total banned:/ {print $NF}')
-                local currently_failed=$(echo "$jail_data" | awk '/Currently failed:/ {print $NF}')
-                local total_failed=$(echo "$jail_data" | awk '/Total failed:/ {print $NF}')
-                
-                # Set defaults if not found
-                currently_banned=${currently_banned:-0}
-                total_banned=${total_banned:-0}
-                currently_failed=${currently_failed:-0}
-                total_failed=${total_failed:-0}
-                
-                log "FAIL2BAN_JAIL" "$name - Parsed: Banned=$currently_banned/$total_banned, Failed=$currently_failed/$total_failed"
-                
-                results+="✅ $name ($ip) - Fail2ban active\n"
-                results+="   📊 Currently banned: $currently_banned IPs\n"
-                results+="   📊 Total bans: $total_banned\n"
-                results+="   📊 Current failed attempts: $currently_failed\n"
-                results+="   📊 Total failed attempts: $total_failed\n"
-                
-                # Extract banned IPs list - they come after "Banned IP list:"
-                if [[ "$currently_banned" != "0" ]]; then
-                    # Get everything after "Banned IP list:" until end of line or next section
-                    local banned_ips=$(echo "$jail_data" | grep "Banned IP list:" | sed 's/.*Banned IP list://' | xargs)
-                    if [[ -n "$banned_ips" ]]; then
-                        # Add to global list for geolocation
-                        for banned_ip in $banned_ips; do
-                            all_banned_ips+=("$banned_ip")
-                        done
-                        
-                        results+="   🚫 Banned IPs:\n"
-                        # Format IPs nicely, max 4 per line
-                        local ip_array=($banned_ips)
-                        local line=""
-                        local count=0
-                        for banned_ip in "${ip_array[@]}"; do
-                            line+="$banned_ip "
-                            ((count++))
-                            if [[ $count -eq 4 ]]; then
-                                results+="      $line\n"
-                                line=""
-                                count=0
-                            fi
-                        done
-                        [[ -n "$line" ]] && results+="      $line\n"
-                    fi
-                fi
-                results+="\n"
-                
-                log "FAIL2BAN_JAIL" "$name - Active | Banned: $currently_banned | Failed: $currently_failed"
-            elif [[ "$jail_data" == *"No jail by the name"* ]]; then
-                results+="⚠️  $name ($ip) - Fail2ban running but SSH jail not found\n\n"
-                log "FAIL2BAN_JAIL" "$name - No jail"
-            else
-                results+="❌ $name ($ip) - Unexpected output from fail2ban\n\n"
-                log "FAIL2BAN_JAIL" "$name - Unexpected output"
-            fi
-        else
-            results+="❌ $name ($ip) - Fail2ban not responding or not installed\n\n"
-            log "FAIL2BAN_JAIL" "$name - Not active or timeout"
-        fi
-    done
-    
-    # If we have banned IPs, geolocate them and show top 10 countries
-    if [[ ${#all_banned_ips[@]} -gt 0 ]]; then
-        results+="════════════════════════════════════════════════════════════════\n"
-        results+="🌍 Geolocation Analysis\n"
-        results+="════════════════════════════════════════════════════════════════\n\n"
-        results+="Analyzing ${#all_banned_ips[@]} banned IPs...\n\n"
-        
-        dialog --title "Geolocating IPs" --infobox "Analyzing ${#all_banned_ips[@]} banned IPs..." 5 50
-        
-        # Check if jq is available
-        if ! command -v jq &> /dev/null; then
-            results+="⚠️  jq not installed - cannot perform geolocation\n"
-            results+="   Install with: apt-get install jq\n\n"
-        else
-            # Geolocate each IP
-            local processed=0
-            local temp_geo_file="/tmp/fail2ban_geo_$$.txt"
-            > "$temp_geo_file"
-            
-            for banned_ip in "${all_banned_ips[@]}"; do
-                ((processed++))
-                dialog --title "Geolocating IPs" --infobox "Processing IP $processed/${#all_banned_ips[@]}: $banned_ip" 5 60
-                
-                # Use ip-api.com for geolocation (free, no API key needed)
-                local geo_data=$(curl -s "http://ip-api.com/json/$banned_ip?fields=country,countryCode" 2>/dev/null)
-                
-                if [[ -n "$geo_data" ]]; then
-                    local country=$(echo "$geo_data" | jq -r '.country // "Unknown"' 2>/dev/null)
-                    if [[ "$country" != "Unknown" && "$country" != "null" && -n "$country" ]]; then
-                        echo "$country" >> "$temp_geo_file"
-                        log "GEOLOCATION" "$banned_ip -> $country"
-                    fi
-                fi
-                
-                # Rate limit to avoid API throttling (5 per second max)
-                sleep 0.2
-            done
-            
-            # Count countries and display top 10
-            if [[ -s "$temp_geo_file" ]]; then
-                results+="🏆 Top 10 Countries of Origin:\n\n"
-                local rank=1
-                
-                # Sort and count countries
-                while IFS= read -r line; do
-                    local count=$(echo "$line" | awk '{print $1}')
-                    local country=$(echo "$line" | cut -d' ' -f2-)
-                    local percentage=$(awk "BEGIN {printf \"%.1f\", ($count / ${#all_banned_ips[@]}) * 100}")
-                    results+="   $rank. $country: $count IPs ($percentage%)\n"
-                    ((rank++))
-                    [[ $rank -gt 10 ]] && break
-                done < <(sort "$temp_geo_file" | uniq -c | sort -rn)
-                
-                results+="\n"
-            else
-                results+="⚠️  No geolocation data available\n\n"
-            fi
-            
-            # Cleanup
-            rm -f "$temp_geo_file"
-        fi
-    fi
-    
-    dialog --title "Jailed IPs Report" --msgbox "$results" 40 85
-}
-
-# ----------------------------------------------------------------------------
-# SSH COMMAND EXECUTION
-# ----------------------------------------------------------------------------
-
 execute_ssh_command() {
     select_nodes "multi" "Execute SSH Command" || return
     
@@ -1752,200 +1062,6 @@ execute_ssh_command() {
     
     local info="Command: $command\nExecution Mode: $exec_mode"
     show_operation_results "⚡ SSH Command Execution" successful failed "$info"
-}
-
-replace_index_html() {
-    log "REPLACE_HTML" "Starting replace_index_html function"
-    
-    # Step 1: Prompt for local index.html file path
-    local local_file=$(get_input "Replace index.html" "Enter path to local index.html file:")
-    [[ -z "$local_file" ]] && { show_msg "Cancelled" "Operation cancelled."; return; }
-    
-    # Expand tilde to home directory if present
-    local_file="${local_file/#\~/$HOME}"
-    
-    # Check if file exists
-    if [[ ! -f "$local_file" ]]; then
-        show_error "File not found: $local_file"
-        log "REPLACE_HTML" "File not found: $local_file"
-        return
-    fi
-    
-    log "REPLACE_HTML" "Local file verified: $local_file"
-    
-    # Step 2: Select nodes
-    select_nodes "multi" "Replace index.html" || return
-    log "REPLACE_HTML" "Nodes selected: ${#SELECTED_NODES_NAMES[@]}"
-    
-    # Check if all selected nodes have valid hostnames
-    local nodes_without_hostname=()
-    for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
-        local hostname="${SELECTED_NODES_HOSTNAMES[i]}"
-        if [[ "$hostname" == "N/A" || -z "$hostname" ]]; then
-            nodes_without_hostname+=("${SELECTED_NODES_NAMES[i]}")
-        fi
-    done
-    
-    # If any nodes lack hostname, show error and stop
-    if [[ ${#nodes_without_hostname[@]} -gt 0 ]]; then
-        local error_msg="The following node(s) don't have a hostname configured:\n\n"
-        for node in "${nodes_without_hostname[@]}"; do
-            error_msg+="• $node\n"
-        done
-        error_msg+="\nPlease edit these nodes first and set their hostname.\n"
-        error_msg+="(Node Management → Edit node → Hostname)\n\n"
-        error_msg+="The hostname is used to locate the path:\n/var/www/<hostname>/index.html"
-        show_error "$error_msg"
-        log "REPLACE_HTML" "Operation aborted: ${#nodes_without_hostname[@]} node(s) without hostname"
-        return
-    fi
-    
-    # Step 3: Prompt for SSH credentials
-    local user=$(get_input "SSH Connection" "SSH username (same for all):")
-    [[ -z "$user" ]] && { show_msg "Cancelled" "Operation cancelled."; return; }
-    log "REPLACE_HTML" "Username entered: $user"
-    
-    local pass=$(get_password "SSH Connection" "SSH password for $user:")
-    [[ -z "$pass" ]] && { show_msg "Cancelled" "Operation cancelled."; return; }
-    log "REPLACE_HTML" "Password entered (length: ${#pass})"
-    
-    # Confirm operation
-    local node_list=""
-    for ((i=0; i<${#SELECTED_NODES_NAMES[@]}; i++)); do
-        node_list+="\n• ${SELECTED_NODES_NAMES[i]} (${SELECTED_NODES_IPS[i]}) → /var/www/${SELECTED_NODES_HOSTNAMES[i]}/index.html"
-    done
-    
-    confirm "Replace index.html on ${#SELECTED_NODES_NAMES[@]} node(s)?$node_list\n\nLocal file: $local_file" || return
-    
-    local successful=() failed=()
-    local total=${#SELECTED_NODES_NAMES[@]} current=0
-    
-    for ((i=0; i<total; i++)); do
-        local name="${SELECTED_NODES_NAMES[i]}" 
-        local ip="${SELECTED_NODES_IPS[i]}" 
-        local hostname="${SELECTED_NODES_HOSTNAMES[i]}"
-        ((current++))
-        
-        log "REPLACE_HTML" "Processing node $current/$total: $name ($ip), hostname: $hostname"
-        
-        local remote_path="/var/www/$hostname/index.html"
-        
-        # Step 4: Test SSH connection
-        dialog --title "Replace index.html" --infobox "Processing $name ($current/$total)...\nTesting connection..." 6 60
-        log "REPLACE_HTML" "Testing SSH connection to $ip"
-        
-        ssh_exec "$ip" "$user" "$pass" "echo 'OK'" "Connection Test" "false" >/dev/null 2>&1
-        if [[ $? -ne 0 ]]; then
-            log "REPLACE_HTML" "SSH connection test FAILED for $name"
-            failed+=("$name: SSH connection failed")
-            continue
-        fi
-        log "REPLACE_HTML" "SSH connection test SUCCESS for $name"
-        
-        # Step 5 & 6: Check if remote directory exists and create backup
-        dialog --title "Replace index.html" --infobox "Processing $name ($current/$total)...\nChecking remote directory..." 6 60
-        log "REPLACE_HTML" "Checking remote directory: /var/www/$hostname"
-        
-        local dir_check=$(ssh_exec "$ip" "$user" "$pass" "[ -d /var/www/$hostname ] && echo EXISTS || echo NOTFOUND" "Check directory" "true" 2>&1)
-        log "REPLACE_HTML" "Directory check result: $dir_check"
-        
-        if ! echo "$dir_check" | grep -q "EXISTS"; then
-            log "REPLACE_HTML" "Directory not found: /var/www/$hostname"
-            failed+=("$name: Directory /var/www/$hostname not found")
-            continue
-        fi
-        
-        # Create backup of existing index.html if it exists
-        dialog --title "Replace index.html" --infobox "Processing $name ($current/$total)...\nCreating backup..." 6 60
-        log "REPLACE_HTML" "Creating backup of existing index.html"
-        
-        local backup_cmd="if [ -f $remote_path ]; then cp $remote_path ${remote_path}.backup_\$(date +%Y%m%d_%H%M%S); echo BACKED_UP; else echo NO_FILE; fi"
-        local backup_result=$(ssh_exec "$ip" "$user" "$pass" "$backup_cmd" "Backup file" "true" 2>&1)
-        log "REPLACE_HTML" "Backup result: $backup_result"
-        
-        # Step 7: Upload file using rsync with password (encrypted connection)
-        dialog --title "Replace index.html" --infobox "Processing $name ($current/$total)...\nUploading index.html..." 6 60
-        log "REPLACE_HTML" "Uploading file via rsync"
-        
-        # Upload to temp location as regular user using sshpass and rsync
-        local temp_file="/tmp/index.html.tmp_$$"
-        
-        # Use expect to handle the upload with password
-        local upload_script=$(mktemp)
-        cat > "$upload_script" << 'UPLOADEOF'
-#!/usr/bin/expect -f
-set timeout 60
-
-if {[llength $argv] != 5} {
-    puts "Error: Expected 5 arguments"
-    exit 1
-}
-
-set user [lindex $argv 0]
-set password [lindex $argv 1]
-set ip [lindex $argv 2]
-set port [lindex $argv 3]
-set local_file [lindex $argv 4]
-
-set remote_file "/tmp/index.html.tmp_[pid]"
-
-log_user 0
-
-spawn rsync -avz -e "ssh -p $port -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" $local_file $user@$ip:$remote_file
-
-expect {
-    -re "assword:" {
-        send "$password\r"
-        exp_continue
-    }
-    eof
-}
-
-catch wait result
-set exit_code [lindex $result 3]
-
-puts $remote_file
-exit $exit_code
-UPLOADEOF
-        
-        chmod +x "$upload_script"
-        
-        log "REPLACE_HTML" "Executing upload to $ip:$temp_file"
-        local upload_output=$("$upload_script" "$user" "$pass" "$ip" "$SSH_PORT" "$local_file" 2>&1)
-        local rsync_exit=$?
-        local actual_temp_file=$(echo "$upload_output" | tail -1)
-        
-        rm -f "$upload_script"
-        
-        log "REPLACE_HTML" "Rsync exit code: $rsync_exit, temp file: $actual_temp_file"
-        
-        if [[ $rsync_exit -ne 0 ]]; then
-            log "REPLACE_HTML" "Rsync failed for $name"
-            failed+=("$name: Upload failed (rsync exit: $rsync_exit)")
-            continue
-        fi
-        
-        # Now move the file to final location with sudo and set proper permissions
-        dialog --title "Replace index.html" --infobox "Processing $name ($current/$total)...\nSetting permissions..." 6 60
-        log "REPLACE_HTML" "Moving file to final location and setting permissions"
-        
-        local move_cmd="mv $actual_temp_file $remote_path && chown www-data:www-data $remote_path 2>/dev/null || chown root:root $remote_path && chmod 644 $remote_path && echo SUCCESS"
-        local move_result=$(ssh_exec "$ip" "$user" "$pass" "$move_cmd" "Move and set permissions" "true" 2>&1)
-        
-        log "REPLACE_HTML" "Move result: $move_result"
-        
-        if echo "$move_result" | grep -q "SUCCESS"; then
-            log "REPLACE_HTML" "Successfully replaced index.html on $name"
-            successful+=("$name: index.html replaced at $remote_path")
-        else
-            log "REPLACE_HTML" "Failed to move file to final location on $name"
-            failed+=("$name: Failed to move file to $remote_path")
-        fi
-    done
-    
-    log "REPLACE_HTML" "Operation completed. Success: ${#successful[@]}, Failed: ${#failed[@]}"
-    local info="📁 Local file: $local_file\n📂 Remote path: /var/www/<hostname>/index.html\n💾 Backups created with timestamp suffix"
-    show_operation_results "🔄 Replace index.html" successful failed "$info"
 }
 
 
@@ -3141,17 +2257,14 @@ node_management_menu() {
 
 node_operations_menu() {
     while true; do
-        local choice=$(dialog --clear --title "Node Operations" --menu "Perform operations on nodes:" 21 70 10 \
+        local choice=$(dialog --clear --title "Node Operations" --menu "Perform operations on nodes:" 18 65 7 \
             1 "Retrieve node roles" 2 "Backup node" 3 "Update nym-node binary" \
             4 "Toggle functionality (Mixnet & Wireguard)" 5 "Restart service" \
-            6 "Replace index.html" 7 "Disable root@ssh" 8 "Fail2ban" \
-            9 "Execute SSH command" \
-            0 "Back to Main Menu" 3>&1 1>&2 2>&3)
+            6 "Execute SSH command" 0 "Back to Main Menu" 3>&1 1>&2 2>&3)
         [[ $? -ne 0 ]] && break
         case $choice in
             1) retrieve_node_roles ;; 2) backup_node ;; 3) update_nym_node ;; 
-            4) toggle_node_functionality ;; 5) restart_service ;; 6) replace_index_html ;; 
-            7) disable_root_ssh ;; 8) activate_fail2ban ;; 9) execute_ssh_command ;;
+            4) toggle_node_functionality ;; 5) restart_service ;; 6) execute_ssh_command ;;
             0) break ;;
         esac
     done
